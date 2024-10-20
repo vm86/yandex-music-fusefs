@@ -1,0 +1,15 @@
+[Unit]
+Description=Yandex Music FUSE mount
+Documentation=https://github.com/vm86/yandex-music-fusefs
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/yamusic-fs %h/Music/Yandex
+ExecStop=/bin/fusermount -u %h/Music/Yandex
+RestartSec=10
+Restart=always
+
+[Install]
+WantedBy=default.target

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-
 import asyncio
 import faulthandler
 import logging
 import os
+import socket
 from argparse import ArgumentParser
 from pathlib import Path
 
@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 pyfuse3_asyncio.enable()
 
 
-def init_logging(debug: bool = False) -> None:
+def init_logging(debug: bool, systemd_run: bool) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO if not debug else logging.DEBUG)
 
@@ -30,7 +30,7 @@ def init_logging(debug: bool = False) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if debug:
+    if debug or systemd_run:
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
         handler.setLevel(logging.INFO if not debug else logging.DEBUG)
@@ -68,14 +68,11 @@ def parse_args():
     return parser.parse_args()
 
 
-async def _loop(async_ya_player):
-    await async_ya_player.start()
-    await pyfuse3.main()
-
-
 def main():
     options = parse_args()
-    init_logging(options.debug)
+    notofy_addr = os.getenv("NOTIFY_SOCKET")
+
+    init_logging(options.debug, notofy_addr is not None)
 
     fuse_options = set(pyfuse3.default_options)
     ya_music_fs = YaMusicFS()
@@ -85,10 +82,20 @@ def main():
     if options.debug_fuse:
         fuse_options.add("debug")
 
+    Path(options.mountpoint).mkdir(exist_ok=True)
     if Path(options.mountpoint).is_mount():
         raise ValueError("Is mount.")
 
-    child_pid = os.fork()
+    socket_notify = None
+    if notofy_addr is None:
+        child_pid = os.fork()
+    else:
+        child_pid = None
+        socket_notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        if notofy_addr[0] == "@":
+            notofy_addr = "\0" + notofy_addr[1:]
+        socket_notify.connect(notofy_addr)
+
     if child_pid:
         if options.wait:
             os.waitpid(child_pid, 0)
@@ -98,9 +105,11 @@ def main():
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(ya_music_fs.start())
+            if socket_notify is not None:
+                socket_notify.sendall(b"READY=1")
             loop.run_until_complete(pyfuse3.main())
         except Exception:
-            pyfuse3.close(unmount=False)
+            pyfuse3.close(unmount=True)
             raise
         finally:
             loop.close()
