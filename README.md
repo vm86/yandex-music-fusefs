@@ -4,7 +4,7 @@
 
 ## Описание
 
-Cделанно только для себя, чтобы слушать музыку в MPD.
+Сделано только для себя, чтобы слушать музыку в MPD.
 
 ### Установка
 
@@ -16,7 +16,42 @@ pip install .
 
 ### Начало работы
 
-Создать файл ~/.config/yandex-fuse.json
+#### Запускаем
+
+```shell
+systemctl --user start yamusic-fs.service
+```
+
+Или
+
+```shell
+yamusic-fs ~/Music/Yandex/
+```
+
+#### Первый запуск
+
+После запуска, откроется страница в браузере с QR-кодом,
+который нужно отсканировать в приложении Я.Ключ.
+Если авторизация прошла успешна в логах появится запись "Token saved".
+И начнется синхронизация плейлиста "Мне нравится".
+После завершения синхронизации в логах будет строка:
+"Loaded track in like playlist .."
+
+#### Отмонтировать
+
+```shell
+systemctl stop yamusic-fs.service --user
+```
+
+Или
+
+```shell
+fusermount -u ~/Music/Yandex
+```
+
+#### Конфигурация
+
+~/.config/yandex-fuse.json
 
 ```json
 {
@@ -27,24 +62,19 @@ pip install .
 ```
 
 token = Токен доступа
+
 best_codec = aac или mp3
+
 blacklist = "Черный список" жанров для "Моя волна"
 
-#### Токен
-
-Задача по получению токена для доступа к данным лежит на плечах пользователя, использующих данную библиотеку. О том как получить токен читайте в [документации](https://github.com/MarshalX/yandex-music-api/blob/main/README.md#%D0%B4%D0%BE%D1%81%D1%82%D1%83%D0%BF-%D0%BA-%D0%B2%D0%B0%D1%88%D0%B8%D0%BC-%D0%B4%D0%B0%D0%BD%D0%BD%D1%8B%D0%BC-%D1%8F%D0%BD%D0%B4%D0%B5%D0%BA%D1%81%D0%BC%D1%83%D0%B7%D1%8B%D0%BA%D0%B0).
-
-#### Запускаем
+#### Логи
 
 ```shell
-yamusic-fs ~/Music/Yandex/
+journalctl --user -u yamusic-fs.service --no-pager
 ```
 
-#### Отмонтировать
+Или
 
 ```shell
-fusermount -u ~/Music/Yandex
-
+cat ~/.cache/yandex_fuse.log
 ```
-
-Логи можно посмотреть в ~/.cache/yandex_fuse.log

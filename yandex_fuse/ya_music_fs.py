@@ -217,6 +217,11 @@ class YaMusicFS(VirtFS):
 
     @retry_request
     async def _update_track(self, track: ExtendTrack, dir_inode: int) -> None:
+        if not track.available:
+            log.warning(
+                "Track %s is not available for listening.", track.save_name
+            )
+            return
         if (exists_track := self._get_link_track_by_id(track.id)) is not None:
             if exists_track["parent_inode"] == dir_inode:
                 return
@@ -313,7 +318,7 @@ class YaMusicFS(VirtFS):
             return
 
         if revision == users_likes_tracks.revision:
-            log.info("Playlist revision %d, no changes.", revision)
+            log.debug("Playlist revision %d, no changes.", revision)
             return
 
         log.info("Totol like track: %d", len(users_likes_tracks.tracks))
@@ -359,7 +364,7 @@ class YaMusicFS(VirtFS):
         dir_inode = playlist_info["inode_id"]
 
         if len(self._get_tracks_by_parent_inode(dir_inode)) >= LIMIT_ONYOURWAVE:
-            log.info("Music directory is full.")
+            log.debug("Music directory is full.")
             return
 
         tasks = set()
@@ -385,11 +390,36 @@ class YaMusicFS(VirtFS):
         log.info("Playlist onyourwave is updated.")
         self._invalidate_inode(dir_inode)
 
-    async def __fsm(self):
+    async def __cleanup_track(self):
+        loaded_tracks = self._get_tracks()
+        ya_tracks = await self._ya_player.tracks(track_ids=loaded_tracks.keys())
+        for ya_track in ya_tracks:
+            if ya_track.available:
+                continue
+            track = loaded_tracks[ya_track.track_id]
+            # TODO: executemany
+            info_track = self._get_link_track_by_id(ya_track.track_id)
+            if info_track is None:
+                continue
+
+            log.warning(
+                "Track %s is not available for listening.", track["name"]
+            )
+
+            self.remove(info_track["parent_inode"], info_track["inode"])
+            self._invalidate_inode(info_track["inode"])
+        log.debug("Cleanup finished.")
+
+    async def __fsm(self) -> None:
         while True:
             try:
+                if not self._ya_player.is_init:
+                    await sleep(5)
+                    continue
                 await self.__update_like_playlists()
                 await self.__update_onyourwave_tracks()
+                await self.__cleanup_track()
+
                 await sleep(300)
             except CancelledError:
                 raise
@@ -415,6 +445,9 @@ class YaMusicFS(VirtFS):
 
         if track is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
+
+        if not self._ya_player.is_init:
+            raise pyfuse3.FUSEError(errno.EPERM)
 
         buffer = await self._get_buffer(track)
         if buffer is None:

@@ -277,7 +277,8 @@ class VirtFS(pyfuse3.Operations):
             (inode,),
         )
 
-    def _get_link_track_by_id(self, track_id: str) -> dict:
+    def _get_link_track_by_id(self, track_id: str) -> dict | None:
+        # BUG: must return list. reference_id -> many track
         return self._get_row(
             """
             SELECT
@@ -542,14 +543,12 @@ class VirtFS(pyfuse3.Operations):
         except OSError:
             pass
 
-    def remove(self, parent_inode: int, entry: FileStat) -> FileStat:
+    def remove(self, parent_inode: int, inode: int) -> None:
         with self.__db_cursor() as cur:
             cur.execute(
                 "DELETE FROM inodes WHERE id=? AND parent_inode=?",
-                (entry.st_ino, parent_inode),
+                (inode, parent_inode),
             )
-
-        return entry
 
     @fail_is_exit
     async def getattr(self, inode: int, ctx=None) -> FileStat:
@@ -695,7 +694,7 @@ class VirtFS(pyfuse3.Operations):
         if stat.S_ISDIR(entry.st_mode):
             raise pyfuse3.FUSEError(errno.EISDIR)
 
-        self.remove(inode_p, entry)
+        self.remove(inode_p, entry.st_ino)
 
     @fail_is_exit
     async def rmdir(self, inode_p, name, ctx):
@@ -704,7 +703,7 @@ class VirtFS(pyfuse3.Operations):
         if not stat.S_ISDIR(entry.st_mode):
             raise pyfuse3.FUSEError(errno.ENOTDIR)
 
-        self.remove(inode_p, entry)
+        self.remove(inode_p, entry.st_ino)
 
     @fail_is_exit
     async def access(self, inode, mode, ctx):

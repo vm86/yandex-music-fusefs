@@ -4,10 +4,14 @@ import logging
 import struct
 import time
 import uuid
+import webbrowser
+from asyncio import sleep
+from asyncio.tasks import create_task
 from io import BytesIO
 from pathlib import Path
 from typing import Any, AsyncGenerator
 
+from aiohttp.client import ClientSession
 from mutagen.id3 import (
     TALB,
     TCON,
@@ -25,7 +29,7 @@ from yandex_music import (
 )
 from yandex_music.utils import model
 
-from yandex_fuse.request import ClientRequest
+from yandex_fuse.request import YandexClientRequest
 
 log = logging.getLogger(__name__)
 
@@ -265,7 +269,7 @@ class ExtendTrack(Track):
 
 class YandexMusicPlayer(ClientAsync):
     _default_settings = {
-        "token": "",
+        "token": None,
         "last_track": None,
         "from_id": f"music-{uuid.uuid4()}",
         "station_id": "user:onyourwave",
@@ -273,7 +277,9 @@ class YandexMusicPlayer(ClientAsync):
         "blacklist": [],
     }
 
-    def __init__(self, settings_path: Path, client_session):
+    def __init__(
+        self, settings_path: Path, client_session: ClientSession
+    ) -> None:
         self.__last_track = None
         self.__last_state = None
         self.__settings = None
@@ -291,14 +297,31 @@ class YandexMusicPlayer(ClientAsync):
             self.__settings = self._default_settings
             self.save_settings()
 
-        if "token" in self.__settings["token"]:
-            raise RuntimeError("Token not found in {self.__settings_path}")
-
         self.__client_session = client_session
-
         super().__init__(
-            self.__settings["token"], request=ClientRequest(client_session)
+            self.__settings["token"],
+            request=YandexClientRequest(client_session),
         )
+
+        self.__init_task = None
+        if not self.__settings["token"]:
+            self.__init_task = create_task(
+                self._init_token(), name="init-token"
+            )
+
+    async def _init_token(self):
+        qr_link = await self._request.get_qr()
+        webbrowser.open_new_tab(qr_link)
+        response = None
+        while response is None:
+            response = await self._request.login_qr()
+            await sleep(5)
+        token_info = await self._request.get_music_token(response)
+        self.__settings["token"] = token_info["access_token"]
+        self._request.set_authorization(self.__settings["token"])
+        self.save_settings()
+        log.info("Token saved.")
+        self.__init_task.cancel()
 
     def save_settings(self):
         self.__settings_path.write_text(json.dumps(self.__settings))
