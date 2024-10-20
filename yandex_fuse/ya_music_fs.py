@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 import logging
 import os
@@ -17,6 +19,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import pyfuse3
 from aiohttp import (
@@ -36,6 +39,9 @@ from yandex_music.exceptions import (
 from yandex_fuse.virt_fs import VirtFS, fail_is_exit
 from yandex_fuse.ya_player import ExtendTrack, TrackTag, YandexMusicPlayer
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 log = logging.getLogger(__name__)
 
 _TAGGING = True
@@ -48,9 +54,11 @@ PLAYLIST_ID2NAME = {
     "likes": "Мне нравится",
 }
 
+T = TypeVar("T")
 
-def retry_request(func, count: int = 3):
-    async def wrapper(*args, **kwargs):
+
+def retry_request(func: Callable, count: int = 3) -> T:
+    async def wrapper(*args: str, **kwargs: dict) -> T:
         for retry in range(1, count + 1):
             log.debug("Retry %d/%d", retry, count)
             try:
@@ -64,7 +72,7 @@ def retry_request(func, count: int = 3):
                 ClientError,
                 SocketTimeoutError,
             ) as err:
-                log.error("Error request: %r %r/%r", err, args[1:], kwargs)
+                log.error("Error request: %r %r/%r", err, args[1:], kwargs)  # noqa:TRY400
                 await sleep(0.5)
 
         return None
@@ -76,7 +84,10 @@ class Buffer:
     CHUNK_SIZE = 128
 
     def __init__(
-        self, direct_link: str, client_session: ClientSession, track: dict
+        self,
+        direct_link: str,
+        client_session: ClientSession,
+        track: dict,
     ) -> None:
         self.__direct_link = direct_link
         self.__client_session = client_session
@@ -89,7 +100,7 @@ class Buffer:
         self.__tagging = not _TAGGING
         self.__ready_read = Event()
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.__ready_read.set()
         if self.__download_task is not None:
             self.__download_task.cancel()
@@ -102,12 +113,12 @@ class Buffer:
     def is_error(self) -> bool:
         return self.__is_error
 
-    def write(self, buffer: bytes):
+    def write(self, buffer: bytes) -> int:
         self.__ready_read.set()
         return self.__bytes.write(buffer)
 
     @property
-    def offset(self):
+    def offset(self) -> int:
         if not self.__tagging:
             return 0
         return len(self.__bytes.getbuffer())
@@ -123,13 +134,13 @@ class Buffer:
         self.__total_read += size
         return bytes(self.__bytes.getbuffer()[offset : offset + size])
 
-    def total_second(self):
+    def total_second(self) -> int:
         s2p = self.__tag.duration_ms / self.__track["size"]
         second_read = s2p * self.__total_read
         return int(min(second_read // 1000, self.__tag.duration_ms // 1000))
 
     @retry_request
-    async def download(self):
+    async def download(self) -> None:
         try:
             buffer = BytesIO()
             async with self.__client_session.request(
@@ -137,8 +148,7 @@ class Buffer:
                 self.__direct_link,
                 headers={"range": f"bytes={self.offset}-"},
             ) as resp:
-                if resp.status not in (200, 206):
-                    raise RuntimeError("%d" % resp.status)
+                resp.raise_for_status()
                 async for chunk in resp.content.iter_chunked(self.CHUNK_SIZE):
                     if not self.__tagging:
                         buffer.write(chunk)
@@ -171,7 +181,7 @@ class StreamReader:
 class YaMusicFS(VirtFS):
     CHUNK_SIZE = 128
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: str, **kwargs: dict) -> None:
         super().__init__(*args, **kwargs)
         self.__client_session = None
 
@@ -180,7 +190,7 @@ class YaMusicFS(VirtFS):
         self._station_id_map_inode: dict[int, int] = {}
         self._tracks = 0
 
-    async def start(self):
+    async def start(self) -> None:
         self.__client_session = ClientSession(
             raise_for_status=False,
             timeout=ClientTimeout(sock_read=3, sock_connect=5),
@@ -193,7 +203,10 @@ class YaMusicFS(VirtFS):
 
     @retry_request
     async def _get_or_update_direct_link(
-        self, track_id: str, codec: str, bitrate_in_kbps: int
+        self,
+        track_id: str,
+        codec: str,
+        bitrate_in_kbps: int,
     ) -> str | None:
         with self._get_direct_link(track_id) as (direct_link, cursor):
             if direct_link is not None:
@@ -201,7 +214,7 @@ class YaMusicFS(VirtFS):
                     "HEAD",
                     direct_link,
                 ) as resp:
-                    if resp.status == 200:
+                    if resp.ok:
                         return direct_link
 
             new_direct_link = await self._ya_player.get_download_link(
@@ -219,7 +232,8 @@ class YaMusicFS(VirtFS):
     async def _update_track(self, track: ExtendTrack, dir_inode: int) -> None:
         if not track.available:
             log.warning(
-                "Track %s is not available for listening.", track.save_name
+                "Track %s is not available for listening.",
+                track.save_name,
             )
             return
         if (exists_track := self._get_link_track_by_id(track.id)) is not None:
@@ -241,7 +255,9 @@ class YaMusicFS(VirtFS):
             )
             if (
                 direct_link := await self._get_or_update_direct_link(
-                    track.track_id, track.codec, track.bitrate_in_kbps
+                    track.track_id,
+                    track.codec,
+                    track.bitrate_in_kbps,
                 )
             ) is None:
                 log.warning("Track %s is not be downloaded!", track.save_name)
@@ -298,7 +314,7 @@ class YaMusicFS(VirtFS):
             x.cancel()
         return unfinished, error
 
-    async def __update_like_playlists(self):
+    async def __update_like_playlists(self) -> None:
         playlist_id = "likes"
         playlist_info = self._get_playlist_by_id(playlist_id)
         if playlist_info is None:
@@ -311,7 +327,7 @@ class YaMusicFS(VirtFS):
         # BUG: if if_modified_since_revision > 0
         #   Traceback: AttributeError: 'str' object has no attribute 'get'
         users_likes_tracks = await self._ya_player.users_likes_tracks(
-            if_modified_since_revision=revision - 1
+            if_modified_since_revision=revision - 1,
         )
         if users_likes_tracks is None:
             log.warning("Like playlist track list empty")
@@ -329,13 +345,14 @@ class YaMusicFS(VirtFS):
         tasks = set()
         error_update = False
         async for track in self._ya_player.load_tracks(
-            tracks, exclude_track_ids=loaded_tracks.keys()
+            tracks,
+            exclude_track_ids=loaded_tracks.keys(),
         ):
             tasks.add(
                 create_task(
                     self._update_track(track, dir_inode),
                     name=f"create-track-{track.save_name}",
-                )
+                ),
             )
             if len(tasks) > LIMIT_TASKS:
                 tasks, error = await self._background_tasks(tasks)
@@ -351,10 +368,11 @@ class YaMusicFS(VirtFS):
 
         self._invalidate_inode(dir_inode)
         log.info(
-            "Loaded track in like playlist %d.", users_likes_tracks.revision
+            "Loaded track in like playlist %d.",
+            users_likes_tracks.revision,
         )
 
-    async def __update_onyourwave_tracks(self):
+    async def __update_onyourwave_tracks(self) -> None:
         playlist_id = "user:onyourwave"
         playlist_info = self._get_playlist_by_id(playlist_id)
         if playlist_info is None:
@@ -374,7 +392,7 @@ class YaMusicFS(VirtFS):
                 create_task(
                     self._update_track(track, dir_inode),
                     name=f"create-track-{track.save_name}",
-                )
+                ),
             )
             if len(tasks) > LIMIT_TASKS:
                 tasks, error = await self._background_tasks(tasks)
@@ -390,20 +408,21 @@ class YaMusicFS(VirtFS):
         log.info("Playlist onyourwave is updated.")
         self._invalidate_inode(dir_inode)
 
-    async def __cleanup_track(self):
+    async def __cleanup_track(self) -> None:
         loaded_tracks = self._get_tracks()
         ya_tracks = await self._ya_player.tracks(track_ids=loaded_tracks.keys())
         for ya_track in ya_tracks:
             if ya_track.available:
                 continue
             track = loaded_tracks[ya_track.track_id]
-            # TODO: executemany
+            # TODO: executemany # noqa: TD002
             info_track = self._get_link_track_by_id(ya_track.track_id)
             if info_track is None:
                 continue
 
             log.warning(
-                "Track %s is not available for listening.", track["name"]
+                "Track %s is not available for listening.",
+                track["name"],
             )
 
             self.remove(info_track["parent_inode"], info_track["inode"])
@@ -440,7 +459,7 @@ class YaMusicFS(VirtFS):
         return Buffer(direct_link, self.__client_session, track)
 
     @fail_is_exit
-    async def open(self, inode, flags, ctx):
+    async def open(self, inode: int, flags: int, ctx=None) -> pyfuse3.FileInfo:  # noqa: ANN001
         track = self._get_track_by_inode(inode)
 
         if track is None:
@@ -459,20 +478,23 @@ class YaMusicFS(VirtFS):
 
         log.debug("Open stream %s -> %d", track["name"], file_info.fh)
         self._fd_map_stream[file_info.fh] = StreamReader(
-            track=track, buffer=buffer
+            track=track,
+            buffer=buffer,
         )
 
         return file_info
 
     @fail_is_exit
-    async def read(self, fd: int, offset: int, size: int):
+    async def read(self, fd: int, offset: int, size: int) -> bytes:
         stream_reader = self._fd_map_stream[fd]
 
         chunk = await stream_reader.buffer.read_from(offset, size)
 
         if len(chunk) > size:
             log.warning(
-                "Chunk is corrupt. Invalid size chunk %d > %d", len(chunk), size
+                "Chunk is corrupt. Invalid size chunk %d > %d",
+                len(chunk),
+                size,
             )
             raise pyfuse3.FUSEError(errno.EPIPE)
 
@@ -480,10 +502,10 @@ class YaMusicFS(VirtFS):
             if (
                 not stream_reader.is_send_feedback
                 and stream_reader.buffer.is_downloded
-                and stream_reader.buffer.total_second() > 30
+                and stream_reader.buffer.total_second() > 30  # noqa: PLR2004
             ):
                 playlist = self._get_playlist_by_inode(
-                    stream_reader.track["parent_inode"]
+                    stream_reader.track["parent_inode"],
                 )
                 if playlist["batch_id"] is not None:
                     await self._ya_player.feedback_track(
@@ -501,7 +523,7 @@ class YaMusicFS(VirtFS):
         return chunk
 
     @fail_is_exit
-    async def release(self, fd: int):
+    async def release(self, fd: int) -> None:
         await super().release(fd)
 
         stream_reader = self._fd_map_stream.pop(fd, None)
@@ -532,7 +554,7 @@ class YaMusicFS(VirtFS):
         except Exception:
             log.exception("Error send feedback:")
 
-    def xattrs(self, inode: int):
+    def xattrs(self, inode: int) -> dict[str, Any]:
         return {
             "inode": inode,
             "nlookup": len(self._nlookup),

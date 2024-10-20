@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import errno
 import logging
 import os
@@ -6,21 +8,24 @@ import stat
 import sys
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Any,
-    Sequence,
-    Tuple,
+    TypeVar,
 )
 
 import pyfuse3
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 log = logging.getLogger(__name__)
 
 
 class FileStat(pyfuse3.EntryAttributes):
-    def __init__(self):
+    def __init__(self) -> None:
         self.st_mode = 0
         self.st_ino = 0
         self.st_dev = 0
@@ -33,9 +38,12 @@ class FileStat(pyfuse3.EntryAttributes):
         self.st_ctime = 0
 
 
+T = TypeVar("T")
+
+
 # Если возникает исключение в FUSE, то вывоз зависает.
-def fail_is_exit(func):
-    async def wrapped(*args, **kwargs):
+def fail_is_exit(func: Callable) -> T:
+    async def wrapped(*args: str, **kwargs: dict) -> T:
         try:
             return await func(*args, **kwargs)
         except pyfuse3.FUSEError:
@@ -48,7 +56,7 @@ def fail_is_exit(func):
 
 
 class VirtFS(pyfuse3.Operations):
-    CREATE_TABLE_QUERYS = [
+    CREATE_TABLE_QUERYS = (
         """
         CREATE TABLE inodes (
             id           INTEGER PRIMARY KEY,
@@ -97,12 +105,12 @@ class VirtFS(pyfuse3.Operations):
             expired    INT NOT NULL
         )
         """,
-    ]
+    )
 
     ROOT_INODE = pyfuse3.ROOT_INODE
 
-    def __init__(self):
-        super(VirtFS, self).__init__()
+    def __init__(self) -> None:
+        super().__init__()
         file_db = Path.home().joinpath(".cache/yandex-fuse.sqlite3")
         is_new = not file_db.exists()
         self._db = sqlite3.connect(file_db, uri=True)
@@ -118,7 +126,7 @@ class VirtFS(pyfuse3.Operations):
         if is_new:
             self.__init_table()
 
-    def __init_table(self):
+    def __init_table(self) -> None:
         with self.__db_cursor() as cur:
             log.debug("Init database.")
 
@@ -143,14 +151,14 @@ class VirtFS(pyfuse3.Operations):
             )
 
     @contextmanager
-    def __db_cursor(self, *, connect: bool = False):
+    def __db_cursor(self, *, connect: bool = False) -> sqlite3.Cursor:
         if connect:
             yield self._db
         else:
             with self._db:
                 yield self._db.cursor()
 
-    def _get_row(self, *a, **kw):
+    def _get_row(self, *a: str, **kw: dict) -> dict:
         with self.__db_cursor() as cur:
             cur.execute(*a, **kw)
             result = cur.fetchone()
@@ -160,7 +168,7 @@ class VirtFS(pyfuse3.Operations):
                 return dict(result)
             return None
 
-    def _get_fd(self):
+    def _get_fd(self) -> int:
         for i in range(2048):
             if i in self._fd_map_inode:
                 continue
@@ -210,7 +218,10 @@ class VirtFS(pyfuse3.Operations):
             return cur.lastrowid
 
     def _update_plyalist(
-        self, uid: str, revision: int, batch_id: str | None = None
+        self,
+        uid: str,
+        revision: int,
+        batch_id: str | None = None,
     ) -> None:
         now_ns = int(time.time() * 1e9)
 
@@ -321,7 +332,7 @@ class VirtFS(pyfuse3.Operations):
             )
             return list(cur.fetchall())
 
-    def _create_track(self, track, parent_inode: int = -1) -> None:
+    def _create_track(self, track: dict, parent_inode: int = -1) -> None:
         with self.__db_cursor() as cur:
             cur.execute(
                 """
@@ -371,7 +382,7 @@ class VirtFS(pyfuse3.Operations):
                 ),
             )
 
-    def _link_track_inode(self, track_id: int, dir_inode: int):
+    def _link_track_inode(self, track_id: int, dir_inode: int) -> None:
         now_ns = int(time.time() * 1e9)
         with self.__db_cursor() as cur:
             cur.execute(
@@ -426,10 +437,13 @@ class VirtFS(pyfuse3.Operations):
         return result
 
     @contextmanager
-    def _get_direct_link(self, track_id: str):
+    def _get_direct_link(
+        self, track_id: str
+    ) -> AbstractContextManager[str | None, sqlite3.Cursor]:
         with self.__db_cursor() as cur:
             cur.execute(
-                "SELECT * FROM direct_link WHERE track_id=?", (track_id,)
+                "SELECT * FROM direct_link WHERE track_id=?",
+                (track_id,),
             )
             row = cur.fetchone()
 
@@ -449,7 +463,9 @@ class VirtFS(pyfuse3.Operations):
             cur.execute("DELETE FROM direct_link WHERE track_id=?", (track_id,))
             yield (None, cur)
 
-    def _insert_direct_link(self, cur, track_id: str, direct_link: str) -> None:
+    def _insert_direct_link(
+        self, cur: sqlite3.Cursor, track_id: str, direct_link: str
+    ) -> None:
         expired = int((time.time() + 8600) * 1e9)
         cur.execute(
             """
@@ -528,20 +544,19 @@ class VirtFS(pyfuse3.Operations):
         entry.st_ctime_ns = row["ctime_ns"]
         return entry
 
-    def _invalidate_inode(self, inode: int):
+    def _invalidate_inode(self, inode: int) -> None:
         if len(self._fd_map_inode) > 0:
             return
         if inode not in self._nlookup:
             return
         if len(self._fd_map_inode) > 0:
             log.warning(
-                "Invalidate inode %d skip. There are open descriptors.", inode
+                "Invalidate inode %d skip. There are open descriptors.",
+                inode,
             )
             return
-        try:
+        with suppress(OSError):
             pyfuse3.invalidate_inode(inode)
-        except OSError:
-            pass
 
     def remove(self, parent_inode: int, inode: int) -> None:
         with self.__db_cursor() as cur:
@@ -551,11 +566,11 @@ class VirtFS(pyfuse3.Operations):
             )
 
     @fail_is_exit
-    async def getattr(self, inode: int, ctx=None) -> FileStat:
+    async def getattr(self, inode: int, ctx=None) -> FileStat:  # noqa: ANN001, ARG002
         return self._get_file_stat_by_inode(inode)
 
     @fail_is_exit
-    async def lookup(self, parent_inode: int, name: str, ctx=None) -> FileStat:
+    async def lookup(self, parent_inode: int, name: str, ctx=None) -> FileStat:  # noqa: ANN001, ARG002
         inode = self._get_inode_by_name(parent_inode, name)
         if inode is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
@@ -564,7 +579,7 @@ class VirtFS(pyfuse3.Operations):
         return await self.getattr(inode)
 
     @fail_is_exit
-    async def forget(self, inode_list: Sequence[Tuple[int, int]]) -> None:
+    async def forget(self, inode_list: Sequence[tuple[int, int]]) -> None:
         for inode, count in inode_list:
             if inode not in self._nlookup:
                 continue
@@ -573,7 +588,7 @@ class VirtFS(pyfuse3.Operations):
                 self._nlookup.pop(inode, 0)
 
     @fail_is_exit
-    async def opendir(self, inode: str, ctx=None) -> int:
+    async def opendir(self, inode: str, ctx=None) -> int:  # noqa: ANN001, ARG002
         fd = self._get_fd()
         self._fd_map_inode[fd].add(inode)
         return fd
@@ -585,7 +600,7 @@ class VirtFS(pyfuse3.Operations):
             self.__fd_token_map_offset_read.pop(inode, None)
 
     @fail_is_exit
-    async def statfs(self, ctx) -> pyfuse3.StatvfsData:
+    async def statfs(self, ctx=None) -> pyfuse3.StatvfsData:  # noqa: ANN001, ARG002
         stat_ = pyfuse3.StatvfsData()
 
         stat_.f_bsize = 512
@@ -604,7 +619,9 @@ class VirtFS(pyfuse3.Operations):
         return stat_
 
     @fail_is_exit
-    async def readdir(self, fd: int, start_id: int, token) -> None:
+    async def readdir(
+        self, fd: int, start_id: int, token: pyfuse3.ReaddirToken
+    ) -> None:
         (dir_inode,) = self._fd_map_inode[fd]
 
         if dir_inode in self.__fd_token_map_offset_read:
@@ -677,18 +694,18 @@ class VirtFS(pyfuse3.Operations):
             self._nlookup[inode] += 1
 
     @fail_is_exit
-    async def open(self, inode, flags, ctx):
+    async def open(self, inode: int, flags: int, ctx=None) -> pyfuse3.FileInfo:  # noqa: ANN001, ARG002
         fd = self._get_fd()
         self._fd_map_inode[fd].add(inode)
 
         return pyfuse3.FileInfo(fh=fd)
 
     @fail_is_exit
-    async def release(self, fd: int):
+    async def release(self, fd: int) -> None:
         self._fd_map_inode.pop(fd)
 
     @fail_is_exit
-    async def unlink(self, inode_p, name, ctx):
+    async def unlink(self, inode_p: int, name: bytes, ctx=None) -> None:  # noqa: ANN001, ARG002
         entry = await self.lookup(inode_p, name)
 
         if stat.S_ISDIR(entry.st_mode):
@@ -697,7 +714,7 @@ class VirtFS(pyfuse3.Operations):
         self.remove(inode_p, entry.st_ino)
 
     @fail_is_exit
-    async def rmdir(self, inode_p, name, ctx):
+    async def rmdir(self, inode_p: int, name: bytes, ctx=None) -> None:  # noqa: ANN001, ARG002
         entry = await self.lookup(inode_p, name)
 
         if not stat.S_ISDIR(entry.st_mode):
@@ -706,7 +723,7 @@ class VirtFS(pyfuse3.Operations):
         self.remove(inode_p, entry.st_ino)
 
     @fail_is_exit
-    async def access(self, inode, mode, ctx):
+    async def access(self, inode: int, mode: int, ctx=None) -> bool:  # noqa: ANN001, ARG002
         return True
 
     def xattrs(self, inode: int) -> dict[str, Any]:
@@ -727,9 +744,9 @@ class VirtFS(pyfuse3.Operations):
         return result
 
     @fail_is_exit
-    async def getxattr(self, inode: int, name: bytes, ctx) -> bytes:
+    async def getxattr(self, inode: int, name: bytes, ctx=None) -> bytes:  # noqa: ANN001, ARG002
         return self.xattrs(inode).get(name.decode(), "").encode()
 
     @fail_is_exit
-    async def listxattr(self, inode: int, ctx) -> Sequence[bytes]:
+    async def listxattr(self, inode: int, ctx=None) -> Sequence[bytes]:  # noqa: ANN001, ARG002
         return self._to_flat_map(self.xattrs(inode))

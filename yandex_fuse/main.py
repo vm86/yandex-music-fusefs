@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 import asyncio
 import faulthandler
 import logging
 import os
 import socket
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import pyfuse3
@@ -18,7 +17,7 @@ log = logging.getLogger(__name__)
 pyfuse3_asyncio.enable()
 
 
-def init_logging(debug: bool, systemd_run: bool) -> None:
+def init_logging(*, debug: bool, systemd_run: bool) -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO if not debug else logging.DEBUG)
 
@@ -26,7 +25,7 @@ def init_logging(debug: bool, systemd_run: bool) -> None:
     logging.getLogger("yandex_music").setLevel(logging.INFO)
 
     formatter = logging.Formatter(
-        "%(asctime)s.%(msecs)03d %(threadName)s: " "[%(name)s] %(message)s",
+        "%(asctime)s.%(msecs)03d %(threadName)s: [%(name)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -42,7 +41,7 @@ def init_logging(debug: bool, systemd_run: bool) -> None:
         root_logger.addHandler(fh)
 
 
-def parse_args():
+def parse_args() -> Namespace:
     parser = ArgumentParser()
 
     parser.add_argument(
@@ -58,21 +57,26 @@ def parse_args():
         help="Enable FUSE debugging output",
     )
     parser.add_argument(
-        "--wait", action="store_true", default=False, help="Run foreground"
+        "--wait",
+        action="store_true",
+        default=False,
+        help="Run foreground",
     )
     parser.add_argument("-o", default="")
     parser.add_argument(
-        "mountpoint", type=str, help="Where to mount the file system"
+        "mountpoint",
+        type=str,
+        help="Where to mount the file system",
     )
 
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     options = parse_args()
-    notofy_addr = os.getenv("NOTIFY_SOCKET")
+    notify_addr = os.getenv("NOTIFY_SOCKET")
 
-    init_logging(options.debug, notofy_addr is not None)
+    init_logging(debug=options.debug, systemd_run=notify_addr is not None)
 
     fuse_options = set(pyfuse3.default_options)
     ya_music_fs = YaMusicFS()
@@ -87,14 +91,14 @@ def main():
         raise ValueError("Is mount.")
 
     socket_notify = None
-    if notofy_addr is None:
+    if notify_addr is None:
         child_pid = os.fork()
     else:
         child_pid = None
         socket_notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        if notofy_addr[0] == "@":
-            notofy_addr = "\0" + notofy_addr[1:]
-        socket_notify.connect(notofy_addr)
+        if notify_addr[0] == "@":
+            notify_addr = "\0" + notify_addr[1:]
+        socket_notify.connect(notify_addr)
 
     if child_pid:
         if options.wait:

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import json
 import logging
@@ -8,10 +10,8 @@ import webbrowser
 from asyncio import sleep
 from asyncio.tasks import create_task
 from io import BytesIO
-from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from aiohttp.client import ClientSession
 from mutagen.id3 import (
     TALB,
     TCON,
@@ -31,11 +31,22 @@ from yandex_music.utils import model
 
 from yandex_fuse.request import YandexClientRequest
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+    from pathlib import Path
+
+    from aiohttp import ClientSession
+
 log = logging.getLogger(__name__)
 
 
 def _list_to_str(attr: str, items: list[Any]) -> str:
     return " ".join([str(getattr(item, attr)) or "" for item in items or []])
+
+
+MP4_HEADER_CHUNK_SIZE = 8
+MP3_HEADER_BUFFER_SIZE = 16000
+HEADER_MIN_CHUNK_SIZE = 64
 
 
 @model
@@ -48,21 +59,21 @@ class TrackTag(YandexMusicObject):
     duration_ms: int
 
     @classmethod
-    def from_json(cls, data: dict) -> "TrackTag":
+    def from_json(cls, data: dict) -> TrackTag:
         return cls(
             **{
                 key: data[key]
                 for key in data
                 if key in cls.__dataclass_fields__
-            }
+            },
         )
 
     def _to_mp4_tag(self, stream: BytesIO) -> bytes | None:
         length = 0
         tag = {}
         while stream.tell() < len(stream.getbuffer()):
-            data = stream.read(8)
-            if len(data) != 8:
+            data = stream.read(MP4_HEADER_CHUNK_SIZE)
+            if len(data) != MP4_HEADER_CHUNK_SIZE:
                 return None
             atom_length, atom_name = struct.unpack(">I4s", data)
             tag[atom_name] = (atom_length, stream.tell())
@@ -110,7 +121,7 @@ class TrackTag(YandexMusicObject):
         return bytes(new_stream.getbuffer())
 
     def _to_mp3_tag(self, stream: BytesIO) -> bytes | None:
-        if len(stream.getbuffer()) < 16000:
+        if len(stream.getbuffer()) < MP3_HEADER_BUFFER_SIZE:
             return None
 
         new_stream = BytesIO()
@@ -134,7 +145,7 @@ class TrackTag(YandexMusicObject):
         return bytes(new_stream.getbuffer())
 
     def to_bytes(self, stream: BytesIO) -> bytes | None:
-        if len(stream.getbuffer()) < 64:
+        if len(stream.getbuffer()) < HEADER_MIN_CHUNK_SIZE:
             return None
         current_offset = stream.tell()
         stream.seek(0)
@@ -159,16 +170,16 @@ class ExtendTrack(Track):
     direct_link: str = ""
 
     @classmethod
-    def from_track(cls, track: Track) -> "ExtendTrack":
+    def from_track(cls, track: Track) -> ExtendTrack:
         return cls(
             **{
                 key: track.__dict__[key]
                 for key in track.__dict__
                 if key in cls.__dataclass_fields__
-            }
+            },
         )
 
-    def to_dict(self, for_request: bool = False) -> dict:
+    def to_dict(self, *, for_request: bool = False) -> dict:
         self.download_info = None
         return super().to_dict(for_request)
 
@@ -190,7 +201,7 @@ class ExtendTrack(Track):
     async def _download_image(self) -> str:
         for size in (600, 400, 300, 200):
             cover_bytes = await self.download_cover_bytes_async(
-                size=f"{size}x{size}"
+                size=f"{size}x{size}",
             )
 
             if not cover_bytes:
@@ -201,7 +212,7 @@ class ExtendTrack(Track):
         return ""
 
     @property
-    def tag(self):
+    def tag(self) -> TrackTag:
         return TrackTag(
             artist=", ".join(self.artists_name()),
             title=self.title or "-",
@@ -211,16 +222,19 @@ class ExtendTrack(Track):
             duration_ms=self.duration_ms,
         )
 
-    def _choose_best_dowanload_info(self):
+    def _choose_best_dowanload_info(self) -> dict[str, int]:
         best_bitrate_in_kbps = {"aac": 0, "mp3": 0}
         track_info = {"aac": None, "mp3": None}
 
         best_codec = self.client.settings["best_codec"].lower()
 
         if self.download_info is None:
+            msg = (
+                f"Download info for track {self.title} empty!"
+                "Call get_download_info(async) before get info."
+            )
             raise ValueError(
-                "Download info for track %s empty!"
-                "Call get_download_info(async) before get info." % self.title
+                msg,
             )
         for info in self.download_info:
             log.debug(
@@ -231,7 +245,8 @@ class ExtendTrack(Track):
             )
 
             best_bitrate_in_kbps[info.codec] = max(
-                info.bitrate_in_kbps, best_bitrate_in_kbps[info.codec]
+                info.bitrate_in_kbps,
+                best_bitrate_in_kbps[info.codec],
             )
 
             if info.bitrate_in_kbps >= best_bitrate_in_kbps[info.codec]:
@@ -268,7 +283,7 @@ class ExtendTrack(Track):
 
 
 class YandexMusicPlayer(ClientAsync):
-    _default_settings = {
+    _default_settings: ClassVar = {
         "token": None,
         "last_track": None,
         "from_id": f"music-{uuid.uuid4()}",
@@ -278,7 +293,9 @@ class YandexMusicPlayer(ClientAsync):
     }
 
     def __init__(
-        self, settings_path: Path, client_session: ClientSession
+        self,
+        settings_path: Path,
+        client_session: ClientSession,
     ) -> None:
         self.__last_track = None
         self.__last_state = None
@@ -306,10 +323,11 @@ class YandexMusicPlayer(ClientAsync):
         self.__init_task = None
         if not self.__settings["token"]:
             self.__init_task = create_task(
-                self._init_token(), name="init-token"
+                self._init_token(),
+                name="init-token",
             )
 
-    async def _init_token(self):
+    async def _init_token(self) -> None:
         qr_link = await self._request.get_qr()
         webbrowser.open_new_tab(qr_link)
         response = None
@@ -323,11 +341,11 @@ class YandexMusicPlayer(ClientAsync):
         log.info("Token saved.")
         self.__init_task.cancel()
 
-    def save_settings(self):
+    def save_settings(self) -> None:
         self.__settings_path.write_text(json.dumps(self.__settings))
 
     @property
-    def settings(self):
+    def settings(self) -> dict[str, Any]:
         return self.__settings
 
     @property
@@ -335,11 +353,13 @@ class YandexMusicPlayer(ClientAsync):
         return self.__settings["token"] is not None
 
     @property
-    def _from_id(self):
+    def _from_id(self) -> str:
         return self.__settings["from_id"]
 
     async def load_tracks(
-        self, tracks: list[Track], exclude_track_ids: list[str]
+        self,
+        tracks: list[Track],
+        exclude_track_ids: list[str],
     ) -> AsyncGenerator[ExtendTrack, None]:
         for track in tracks:
             if str(track.id) in exclude_track_ids:
@@ -360,7 +380,8 @@ class YandexMusicPlayer(ClientAsync):
 
         while len(tracks) < count:
             station_tracks = await self.rotor_station_tracks(
-                station=station_id, queue=self.__last_track
+                station=station_id,
+                queue=self.__last_track,
             )
 
             if self.__last_station_id != (station_id, station_tracks.batch_id):
@@ -422,11 +443,14 @@ class YandexMusicPlayer(ClientAsync):
             self.__settings["last_track"] = self.__last_track
             self.save_settings()
 
-    def get_last_station_info(self):
+    def get_last_station_info(self) -> str:
         return self.__last_station_id
 
     async def get_download_link(
-        self, track_id: str, codec: str, bitrate_in_kbps: int
+        self,
+        track_id: str,
+        codec: str,
+        bitrate_in_kbps: int,
     ) -> str | None:
         download_info = await self.tracks_download_info(track_id)
         for info in download_info:
@@ -441,7 +465,7 @@ class YandexMusicPlayer(ClientAsync):
         feedback: str,
         batch_id: str,
         total_played_seconds: int,
-    ):
+    ) -> None:
         # trackStarted, trackFinished, skip.
         if self.__last_station_id is None:
             return

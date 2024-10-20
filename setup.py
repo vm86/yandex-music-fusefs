@@ -7,7 +7,7 @@ from setuptools import setup
 SERVICE_NAME = "yamusic-fs.service"
 
 
-def install():
+def install() -> None:
     shutil.copy2(
         Path(f"contrib/{SERVICE_NAME}"),
         Path.home().joinpath(f".config/systemd/user/{SERVICE_NAME}"),

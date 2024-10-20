@@ -1,11 +1,12 @@
 # https://github.com/AlexxIT/YandexStation/blob/master/custom_components/yandex_station/core/yandex_session.py
+from __future__ import annotations
 
 import asyncio
 import json
 import re
 from typing import Any
 
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, CookieJar
 from yandex_music.exceptions import (
     BadRequestError,
     NetworkError,
@@ -21,15 +22,22 @@ from yandex_music.utils.request_async import (
 
 
 class ClientRequest(Request):
-    def __init__(self, client_session: ClientSession, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        client_session: ClientSession,
+        *args: str,
+        **kwargs: dict[str, Any],
+    ) -> None:
         super().__init__(*args, **kwargs)
         self.__client_session = client_session
 
     @property
-    def _cookie_jar(self):
+    def _cookie_jar(self) -> CookieJar:
         return self.__client_session.cookie_jar
 
-    async def _request_wrapper(self, *args: Any, **kwargs: Any) -> bytes:  # noqa: C901
+    async def _request_wrapper(  # noqa: C901
+        self, *args: str, **kwargs: dict[str, Any]
+    ) -> bytes:
         if "headers" not in kwargs:
             kwargs["headers"] = {}
 
@@ -45,7 +53,7 @@ class ClientRequest(Request):
         except ClientError as e:
             raise NetworkError(e) from e
 
-        if 200 <= resp.status <= 299:
+        if resp.ok:
             return content
 
         message = "Unknown error"
@@ -58,32 +66,34 @@ class ClientRequest(Request):
 
         if resp.status in (401, 403):
             raise UnauthorizedError(message)
-        if resp.status == 400:
+        if resp.status == 400:  # noqa: PLR2004
             raise BadRequestError(message)
-        if resp.status == 404:
+        if resp.status == 404:  # noqa: PLR2004
             raise NotFoundError(message)
         if resp.status in (409, 413):
             raise NetworkError(message)
 
-        if resp.status == 502:
+        if resp.status == 502:  # noqa: PLR2004
             raise NetworkError("Bad Gateway")
 
         raise NetworkError(f"{message} ({resp.status}): {content}")
 
 
 class YandexClientRequest(ClientRequest):
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args: str, **kwargs: dict[str, Any]) -> None:
         super().__init__(*args, **kwargs)
         self._auth_payload: dict = {}
 
     async def get_qr(self) -> str:
         # step 1: csrf_token
         response_csrf_token = await self._request_wrapper(
-            "GET", "https://passport.yandex.ru/am?app_platform=android"
+            "GET",
+            "https://passport.yandex.ru/am?app_platform=android",
         )
 
         re_result = re.search(
-            rb'"csrf_token" value="([^"]+)"', response_csrf_token
+            rb'"csrf_token" value="([^"]+)"',
+            response_csrf_token,
         )
         if re_result is None:
             raise RuntimeError("CSRF token not found!")
@@ -129,7 +139,7 @@ class YandexClientRequest(ClientRequest):
                 f"{c.key}={c.value}"
                 for c in self._cookie_jar
                 if c["domain"].endswith("yandex.ru")
-            ]
+            ],
         )
         # https://gist.github.com/superdima05/04601c6b15d5eeb1c376535579d08a99
         response = await self._request_wrapper(
@@ -156,6 +166,8 @@ class YandexClientRequest(ClientRequest):
             "access_token": x_token,
         }
         response = await self._request_wrapper(
-            "POST", "https://oauth.mobile.yandex.net/1/token", data=payload
+            "POST",
+            "https://oauth.mobile.yandex.net/1/token",
+            data=payload,
         )
         return json.loads(response)
