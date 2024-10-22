@@ -125,8 +125,10 @@ class YandexClientRequest(ClientRequest):
             "csrf_token": response_json["csrf_token"],
             "track_id": response_json["track_id"],
         }
-
-        return f"https://passport.yandex.ru/auth/magic/code/?track_id={self._auth_payload["track_id"]}"
+        track_id = response_json["track_id"]
+        return (
+            f"https://passport.yandex.ru/auth/magic/code/?track_id={track_id}"
+        )
 
     async def login_qr(self) -> str | None:
         response = await self._request_wrapper(
