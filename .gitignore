@@ -49,3 +49,5 @@ ENV/
 
 # ruff
 .ruff_cache
+
+VERSION

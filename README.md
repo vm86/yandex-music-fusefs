@@ -1,4 +1,4 @@
-## Yandex Music FuseFS
+# Yandex Music FuseFS
 
 ⚠️ Это неофициальная ФС.
 
@@ -6,12 +6,28 @@
 
 Сделано только для себя, чтобы слушать музыку в MPD.
 
+### Системные зависимости
+
+[pyfuse3](https://pyfuse3.readthedocs.io/en/latest/install.html)
+
+#### Debian\Ubuntu
+
+```shell
+sudo apt install pkg-config fuse3 libfuse3-dev libfuse-dev -y
+```
+
+#### Fedora
+
+```shell
+sudo dnf install pkg-config fuse3 fuse3-devel python3-devel gcc -y
+```
+
 ### Установка
 
+[Скачать](https://github.com/vm86/yandex-music-fusefs/releases)
+
 ``` shell
-git clone https://github.com/vm86/yandex-music-fusefs
-cd yandex-music-fusefs
-pip install .
+pip install yandex_fuse-*.tar.gz
 ```
 
 ### Начало работы
