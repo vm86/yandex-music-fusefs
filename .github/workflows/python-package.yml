@@ -26,10 +26,15 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install build ruff
+        python -m pip install build ruff mypy
+        sudo apt install fuse3 libfuse3-dev libfuse-dev -y
+        python -m pip install -e .
     - name: Lint with ruff
       run: |
         ruff check
+    - name: Lint with mypy
+      run: |
+        mypy yandex_fuse
     - name: Build package
       run: python -m build
     - name: Release

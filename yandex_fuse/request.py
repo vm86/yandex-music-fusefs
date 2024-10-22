@@ -4,10 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any, ParamSpec
 
-from aiohttp import ClientError, ClientSession, CookieJar
-from yandex_music.exceptions import (
+from aiohttp import ClientError, ClientSession
+from yandex_music.exceptions import (  # type: ignore[import-untyped]
     BadRequestError,
     NetworkError,
     NotFoundError,
@@ -15,28 +15,33 @@ from yandex_music.exceptions import (
     UnauthorizedError,
     YandexMusicError,
 )
-from yandex_music.utils.request_async import (
+from yandex_music.utils.request_async import (  # type: ignore[import-untyped]
     USER_AGENT,
     Request,
 )
 
+if TYPE_CHECKING:
+    from aiohttp.abc import AbstractCookieJar
 
-class ClientRequest(Request):
+P = ParamSpec("P")
+
+
+class ClientRequest(Request):  # type: ignore[misc]
     def __init__(
         self,
         client_session: ClientSession,
-        *args: str,
-        **kwargs: dict[str, Any],
+        *args: P.args,
+        **kwargs: P.kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.__client_session = client_session
 
     @property
-    def _cookie_jar(self) -> CookieJar:
+    def _cookie_jar(self) -> AbstractCookieJar:
         return self.__client_session.cookie_jar
 
     async def _request_wrapper(  # noqa: C901
-        self, *args: str, **kwargs: dict[str, Any]
+        self, method: str, url: str, **kwargs: dict[str, Any]
     ) -> bytes:
         if "headers" not in kwargs:
             kwargs["headers"] = {}
@@ -45,7 +50,9 @@ class ClientRequest(Request):
 
         kwargs.pop("timeout", None)
         try:
-            async with self.__client_session.request(*args, **kwargs) as _resp:
+            async with self.__client_session.request(
+                method, url, **kwargs
+            ) as _resp:
                 resp = _resp
                 content = await resp.content.read()
         except asyncio.TimeoutError as e:
@@ -76,13 +83,15 @@ class ClientRequest(Request):
         if resp.status == 502:  # noqa: PLR2004
             raise NetworkError("Bad Gateway")
 
-        raise NetworkError(f"{message} ({resp.status}): {content}")
+        raise NetworkError(f"{message} ({resp.status}): {content!r}")
 
 
 class YandexClientRequest(ClientRequest):
-    def __init__(self, *args: str, **kwargs: dict[str, Any]) -> None:
-        super().__init__(*args, **kwargs)
-        self._auth_payload: dict = {}
+    def __init__(
+        self, client_session: ClientSession, *args: P.args, **kwargs: P.kwargs
+    ) -> None:
+        super().__init__(client_session, *args, **kwargs)
+        self._auth_payload: dict[str, str] = {}
 
     async def get_qr(self) -> str:
         # step 1: csrf_token
@@ -119,7 +128,7 @@ class YandexClientRequest(ClientRequest):
 
         return f"https://passport.yandex.ru/auth/magic/code/?track_id={self._auth_payload["track_id"]}"
 
-    async def login_qr(self) -> str:
+    async def login_qr(self) -> str | None:
         response = await self._request_wrapper(
             "POST",
             "https://passport.yandex.ru/auth/new/magic/status/",
@@ -155,9 +164,10 @@ class YandexClientRequest(ClientRequest):
             },
         )
         response_json = json.loads(response)
-        return response_json["access_token"]
+        token: str = response_json["access_token"]
+        return token
 
-    async def get_music_token(self, x_token: str) -> dict:
+    async def get_music_token(self, x_token: str) -> dict[str, str]:
         payload = {
             # Thanks to https://github.com/MarshalX/yandex-music-api/
             "client_secret": "53bc75238f0c4d08a118e51fe9203300",
@@ -170,4 +180,5 @@ class YandexClientRequest(ClientRequest):
             "https://oauth.mobile.yandex.net/1/token",
             data=payload,
         )
-        return json.loads(response)
+        response_json: dict[str, str] = json.loads(response)
+        return response_json

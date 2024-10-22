@@ -12,7 +12,7 @@ from asyncio.tasks import create_task
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from mutagen.id3 import (
+from mutagen.id3 import (  # type: ignore[attr-defined]
     TALB,
     TCON,
     TIT2,
@@ -22,12 +22,13 @@ from mutagen.id3 import (
 )
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
-from yandex_music import (
+from yandex_music import (  # type: ignore[import-untyped]
     ClientAsync,
+    DownloadInfo,
     Track,
     YandexMusicObject,
 )
-from yandex_music.utils import model
+from yandex_music.utils import model  # type: ignore[import-untyped]
 
 from yandex_fuse.request import YandexClientRequest
 
@@ -50,7 +51,7 @@ HEADER_MIN_CHUNK_SIZE = 64
 
 
 @model
-class TrackTag(YandexMusicObject):
+class TrackTag(YandexMusicObject):  # type: ignore[misc]
     artist: str
     title: str
     album: str
@@ -59,7 +60,7 @@ class TrackTag(YandexMusicObject):
     duration_ms: int
 
     @classmethod
-    def from_json(cls, data: dict) -> TrackTag:
+    def from_json(cls, data: dict[str, int | str]) -> TrackTag:
         return cls(
             **{
                 key: data[key]
@@ -88,10 +89,10 @@ class TrackTag(YandexMusicObject):
         stream.seek(0)
         tag_stream.write(stream.read(length))
 
-        audiofile = MP4(fileobj=tag_stream)
+        audiofile = MP4(fileobj=tag_stream)  # type: ignore[no-untyped-call]
         audiofile.delete(fileobj=tag_stream)
         if audiofile.tags is None:
-            audiofile.add_tags()
+            audiofile.add_tags()  # type: ignore[no-untyped-call]
         # https://mutagen.readthedocs.io/en/latest/api/mp4.html#mutagen.mp4.MP4Tags
         audiofile["\xa9nam"] = self.title
         audiofile["\xa9alb"] = self.album
@@ -100,7 +101,7 @@ class TrackTag(YandexMusicObject):
         audiofile["\xa9gen"] = self.genre
         # audiofile["covr"] =
         stream.seek(0)
-        audiofile.save(fileobj=tag_stream)
+        audiofile.save(fileobj=tag_stream)  # type: ignore[no-untyped-call]
 
         stream.seek(0)
         tag_stream.seek(0)
@@ -130,14 +131,14 @@ class TrackTag(YandexMusicObject):
         audiofile = MP3(fileobj=new_stream)
         audiofile.delete(fileobj=new_stream)
         if audiofile.tags is None:
-            audiofile.add_tags()
+            audiofile.add_tags()  # type: ignore[no-untyped-call]
 
-        audiofile["TIT2"] = TIT2(encoding=3, text=self.title)
-        audiofile["TPE1"] = TPE1(encoding=3, text=self.artist)
-        audiofile["TALB"] = TALB(encoding=3, text=self.album)
-        audiofile["TYER"] = TYER(encoding=3, text=self.year)
-        audiofile["TCON"] = TCON(encoding=3, text=self.genre)
-        audiofile["TLEN"] = TLEN(encoding=3, text=str(self.duration_ms))
+        audiofile["TIT2"] = TIT2(encoding=3, text=self.title)  # type: ignore[no-untyped-call]
+        audiofile["TPE1"] = TPE1(encoding=3, text=self.artist)  # type: ignore[no-untyped-call]
+        audiofile["TALB"] = TALB(encoding=3, text=self.album)  # type: ignore[no-untyped-call]
+        audiofile["TYER"] = TYER(encoding=3, text=self.year)  # type: ignore[no-untyped-call]
+        audiofile["TCON"] = TCON(encoding=3, text=self.genre)  # type: ignore[no-untyped-call]
+        audiofile["TLEN"] = TLEN(encoding=3, text=str(self.duration_ms))  # type: ignore[no-untyped-call]
 
         new_stream.seek(0)
         audiofile.save(fileobj=new_stream)
@@ -151,9 +152,9 @@ class TrackTag(YandexMusicObject):
         stream.seek(0)
 
         try:
-            if MP4.score(None, None, bytes(stream.getbuffer())):
+            if MP4.score(None, None, bytes(stream.getbuffer())):  # type: ignore[no-untyped-call]
                 return self._to_mp4_tag(stream)
-            if MP3.score("", None, bytes(stream.getbuffer())):
+            if MP3.score("", None, bytes(stream.getbuffer())):  # type: ignore[no-untyped-call]
                 return self._to_mp3_tag(stream)
         finally:
             stream.seek(current_offset)
@@ -161,7 +162,7 @@ class TrackTag(YandexMusicObject):
 
 
 @model
-class ExtendTrack(Track):
+class ExtendTrack(Track):  # type: ignore[misc]
     station_id: str = ""
     batch_id: int = 0
     size: int = 0
@@ -178,10 +179,6 @@ class ExtendTrack(Track):
                 if key in cls.__dataclass_fields__
             },
         )
-
-    def to_dict(self, *, for_request: bool = False) -> dict:
-        self.download_info = None
-        return super().to_dict(for_request)
 
     @property
     def save_name(self) -> str:
@@ -222,12 +219,12 @@ class ExtendTrack(Track):
             duration_ms=self.duration_ms,
         )
 
-    def _choose_best_dowanload_info(self) -> dict[str, int]:
+    def _choose_best_dowanload_info(self) -> DownloadInfo:
         best_bitrate_in_kbps = {"aac": 0, "mp3": 0}
-        track_info = {"aac": None, "mp3": None}
+        track_info: dict[str, DownloadInfo | None] = {"aac": None, "mp3": None}
 
         best_codec = self.client.settings["best_codec"].lower()
-
+        self.download_info: list[DownloadInfo] | None
         if self.download_info is None:
             msg = (
                 f"Download info for track {self.title} empty!"
@@ -236,6 +233,7 @@ class ExtendTrack(Track):
             raise ValueError(
                 msg,
             )
+
         for info in self.download_info:
             log.debug(
                 "Track %s %s/%d",
@@ -255,6 +253,9 @@ class ExtendTrack(Track):
         track_codec_info = track_info.pop(best_codec)
         if track_codec_info is None:
             _, track_codec_info = track_info.popitem()
+            if track_codec_info is None:
+                raise RuntimeError(f"Track info {self.title} is empty.")
+
             log.warning(
                 "Best codec %s from track %s not available. Fallback. %s",
                 best_codec,
@@ -282,7 +283,7 @@ class ExtendTrack(Track):
         self.download_info = [download_info]
 
 
-class YandexMusicPlayer(ClientAsync):
+class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
     _default_settings: ClassVar = {
         "token": None,
         "last_track": None,
@@ -297,11 +298,9 @@ class YandexMusicPlayer(ClientAsync):
         settings_path: Path,
         client_session: ClientSession,
     ) -> None:
-        self.__last_track = None
-        self.__last_state = None
-        self.__settings = None
-        self.__current_station = None
-        self.__last_station_id = None
+        self.__last_track: str = ""
+        self.__last_station_id: tuple[str, str] = ("", "")
+        self.__settings: dict[str, Any] = {}
 
         self.__settings_path = settings_path
         try:
@@ -333,13 +332,18 @@ class YandexMusicPlayer(ClientAsync):
         response = None
         while response is None:
             response = await self._request.login_qr()
+            if response:
+                break
             await sleep(5)
         token_info = await self._request.get_music_token(response)
         self.__settings["token"] = token_info["access_token"]
         self._request.set_authorization(self.__settings["token"])
         self.save_settings()
         log.info("Token saved.")
-        self.__init_task.cancel()
+        if self.__init_task is not None:
+            init_task = self.__init_task
+            self.__init_task = None
+            init_task.cancel()
 
     def save_settings(self) -> None:
         self.__settings_path.write_text(json.dumps(self.__settings))
@@ -354,12 +358,13 @@ class YandexMusicPlayer(ClientAsync):
 
     @property
     def _from_id(self) -> str:
-        return self.__settings["from_id"]
+        result: str = self.__settings["from_id"]
+        return result
 
     async def load_tracks(
         self,
         tracks: list[Track],
-        exclude_track_ids: list[str],
+        exclude_track_ids: set[str],
     ) -> AsyncGenerator[ExtendTrack, None]:
         for track in tracks:
             if str(track.id) in exclude_track_ids:
@@ -376,7 +381,7 @@ class YandexMusicPlayer(ClientAsync):
         if station_id is None:
             raise ValueError("Station is not select!")
 
-        tracks = set()
+        tracks: set[str] = set()
 
         while len(tracks) < count:
             station_tracks = await self.rotor_station_tracks(
@@ -443,7 +448,7 @@ class YandexMusicPlayer(ClientAsync):
             self.__settings["last_track"] = self.__last_track
             self.save_settings()
 
-    def get_last_station_info(self) -> str:
+    def get_last_station_info(self) -> tuple[str, str]:
         return self.__last_station_id
 
     async def get_download_link(
@@ -455,8 +460,8 @@ class YandexMusicPlayer(ClientAsync):
         download_info = await self.tracks_download_info(track_id)
         for info in download_info:
             if info.codec == codec and info.bitrate_in_kbps == bitrate_in_kbps:
-                return await info.get_direct_link_async()
-
+                direct_link: str = await info.get_direct_link_async()
+                return direct_link
         return None
 
     async def feedback_track(
@@ -467,10 +472,9 @@ class YandexMusicPlayer(ClientAsync):
         total_played_seconds: int,
     ) -> None:
         # trackStarted, trackFinished, skip.
-        if self.__last_station_id is None:
-            return
         station_id, station_batch_id = self.__last_station_id
-
+        if not station_id or not station_batch_id:
+            return
         try:
             await self.rotor_station_feedback(
                 station=station_id,

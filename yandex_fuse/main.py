@@ -7,7 +7,7 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 
 import pyfuse3
-import pyfuse3_asyncio
+import pyfuse3_asyncio  # type: ignore[import-untyped]
 
 from yandex_fuse.ya_music_fs import YaMusicFS
 

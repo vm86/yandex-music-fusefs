@@ -8,26 +8,44 @@ import stat
 import sys
 import time
 from collections import defaultdict
-from contextlib import AbstractContextManager, contextmanager, suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    TypeVar,
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
+
+from pyfuse3 import (
+    ROOT_INODE,
+    EntryAttributes,
+    FileHandleT,
+    FileInfo,
+    FileNameT,
+    FlagT,
+    FUSEError,
+    InodeT,
+    ModeT,
+    Operations,
+    ReaddirToken,
+    RequestContext,
+    StatvfsData,
+    XAttrNameT,
+    invalidate_inode,
+    readdir_reply,
 )
 
-import pyfuse3
-
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import (
+        Callable,
+        Coroutine,
+        Iterator,
+        Sequence,
+    )
 
 log = logging.getLogger(__name__)
 
 
-class FileStat(pyfuse3.EntryAttributes):
+class FileStat(EntryAttributes):
     def __init__(self) -> None:
-        self.st_mode = 0
-        self.st_ino = 0
+        self.st_mode = ModeT(0)
+        self.st_ino = InodeT(0)
         self.st_dev = 0
         self.st_nlink = 0
         self.st_uid = 0
@@ -38,15 +56,21 @@ class FileStat(pyfuse3.EntryAttributes):
         self.st_ctime = 0
 
 
+P = ParamSpec("P")
 T = TypeVar("T")
+
+ROW_DICT_TYPE = dict[str, Any] | None
+ROW_TYPE = int | None
 
 
 # Если возникает исключение в FUSE, то вывоз зависает.
-def fail_is_exit(func: Callable) -> T:
-    async def wrapped(*args: str, **kwargs: dict) -> T:
+def fail_is_exit(
+    func: Callable[..., Coroutine[Any, Any, T]],
+) -> Callable[..., Coroutine[Any, Any, T]]:
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
         try:
             return await func(*args, **kwargs)
-        except pyfuse3.FUSEError:
+        except FUSEError:
             raise
         except Exception:
             log.exception("Error %r", func)
@@ -55,7 +79,7 @@ def fail_is_exit(func: Callable) -> T:
     return wrapped
 
 
-class VirtFS(pyfuse3.Operations):
+class VirtFS(Operations):
     CREATE_TABLE_QUERYS = (
         """
         CREATE TABLE inodes (
@@ -107,7 +131,7 @@ class VirtFS(pyfuse3.Operations):
         """,
     )
 
-    ROOT_INODE = pyfuse3.ROOT_INODE
+    ROOT_INODE = ROOT_INODE
 
     def __init__(self) -> None:
         super().__init__()
@@ -117,14 +141,21 @@ class VirtFS(pyfuse3.Operations):
 
         self._db.row_factory = sqlite3.Row
 
-        self._fd_map_inode = defaultdict(set)
+        self._fd_map_inode: dict[int, set[int]] = defaultdict(set)
 
-        self._nlookup = defaultdict(int)
+        self._nlookup: dict[int, int] = defaultdict(int)
 
-        self.__fd_token_map_offset_read = defaultdict(list)
+        self.__fd_token_map_offset_read: dict[int, list[tuple[str, int]]] = (
+            defaultdict(list)
+        )
 
         if is_new:
             self.__init_table()
+
+    @contextmanager
+    def __db_cursor(self) -> Iterator[sqlite3.Cursor]:
+        with self._db:
+            yield self._db.cursor()
 
     def __init_table(self) -> None:
         with self.__db_cursor() as cur:
@@ -150,22 +181,26 @@ class VirtFS(pyfuse3.Operations):
                 ),
             )
 
-    @contextmanager
-    def __db_cursor(self, *, connect: bool = False) -> sqlite3.Cursor:
-        if connect:
-            yield self._db
-        else:
-            with self._db:
-                yield self._db.cursor()
-
-    def _get_row(self, *a: str, **kw: dict) -> dict:
+    def _get_dict_row(
+        self, query: str, *params: tuple[str | int, ...]
+    ) -> ROW_DICT_TYPE:
         with self.__db_cursor() as cur:
-            cur.execute(*a, **kw)
+            cur.execute(query, *params)
             result = cur.fetchone()
             if result:
-                if len(result) == 1:
-                    return result[0]
                 return dict(result)
+            return None
+
+    def _get_row(self, query: str, *params: tuple[str | int, ...]) -> ROW_TYPE:
+        with self.__db_cursor() as cur:
+            cur.execute(query, *params)
+            result = cur.fetchone()
+            if not result:
+                return None
+            if len(result) > 1:
+                raise RuntimeError("Multi row result!")
+            if result:
+                return result[0]  # type: ignore[no-any-return]
             return None
 
     def _get_fd(self) -> int:
@@ -174,7 +209,7 @@ class VirtFS(pyfuse3.Operations):
                 continue
 
             return i
-        raise pyfuse3.FUSEError(errno.ENOENT)
+        raise FUSEError(errno.ENOENT)
 
     def _create_plyalist(self, name: str, uid: str) -> int:
         with self.__db_cursor() as cur:
@@ -215,6 +250,8 @@ class VirtFS(pyfuse3.Operations):
                     row_id,
                 ),
             )
+            if cur.lastrowid is None:
+                raise RuntimeError("Should never happen. lastrowid is None.")
             return cur.lastrowid
 
     def _update_plyalist(
@@ -252,8 +289,8 @@ class VirtFS(pyfuse3.Operations):
                 ),
             )
 
-    def _get_playlist_by_id(self, uid: str) -> dict:
-        return self._get_row(
+    def _get_playlist_by_id(self, uid: str) -> ROW_DICT_TYPE:
+        return self._get_dict_row(
             """
             SELECT
                 inodes.id AS inode_id,
@@ -270,8 +307,8 @@ class VirtFS(pyfuse3.Operations):
             (uid,),
         )
 
-    def _get_playlist_by_inode(self, inode: int) -> dict:
-        return self._get_row(
+    def _get_playlist_by_inode(self, inode: int) -> ROW_DICT_TYPE:
+        return self._get_dict_row(
             """
             SELECT
                 inodes.id AS inode_id,
@@ -288,9 +325,9 @@ class VirtFS(pyfuse3.Operations):
             (inode,),
         )
 
-    def _get_link_track_by_id(self, track_id: str) -> dict | None:
+    def _get_link_track_by_id(self, track_id: str) -> ROW_DICT_TYPE:
         # BUG: must return list. reference_id -> many track
-        return self._get_row(
+        return self._get_dict_row(
             """
             SELECT
                 inodes.id AS inode,
@@ -304,8 +341,8 @@ class VirtFS(pyfuse3.Operations):
             (track_id,),
         )
 
-    def _get_track_by_inode(self, inode: int) -> dict:
-        return self._get_row(
+    def _get_track_by_inode(self, inode: int) -> ROW_DICT_TYPE:
+        return self._get_dict_row(
             """
             SELECT
                 *
@@ -317,7 +354,9 @@ class VirtFS(pyfuse3.Operations):
             (inode,),
         )
 
-    def _get_tracks_by_parent_inode(self, parent_inode: int) -> list[dict]:
+    def _get_tracks_by_parent_inode(
+        self, parent_inode: int
+    ) -> list[ROW_DICT_TYPE]:
         with self.__db_cursor() as cur:
             cur.execute(
                 """
@@ -332,7 +371,9 @@ class VirtFS(pyfuse3.Operations):
             )
             return list(cur.fetchall())
 
-    def _create_track(self, track: dict, parent_inode: int = -1) -> None:
+    def _create_track(
+        self, track: tuple[Any, ...], parent_inode: int = -1
+    ) -> None:
         with self.__db_cursor() as cur:
             cur.execute(
                 """
@@ -410,7 +451,7 @@ class VirtFS(pyfuse3.Operations):
                 ),
             )
 
-    def _get_tracks(self) -> dict[int, Any]:
+    def _get_tracks(self) -> dict[str, Any]:
         result = {}
         with self.__db_cursor() as cur:
             cur.execute(
@@ -439,7 +480,7 @@ class VirtFS(pyfuse3.Operations):
     @contextmanager
     def _get_direct_link(
         self, track_id: str
-    ) -> AbstractContextManager[str | None, sqlite3.Cursor]:
+    ) -> Iterator[tuple[str | None, sqlite3.Cursor]]:
         with self.__db_cursor() as cur:
             cur.execute(
                 "SELECT * FROM direct_link WHERE track_id=?",
@@ -477,14 +518,14 @@ class VirtFS(pyfuse3.Operations):
             (track_id, direct_link, expired),
         )
 
-    def _get_inode_by_name(self, parent_inode: int, name: str) -> int:
-        name = name.replace(b"\\", b"").decode()
-        inode = None
+    def _get_inode_by_name(self, parent_inode: int, name: bytes) -> int | None:
+        str_name = name.replace(b"\\", b"").decode()
+        inode: int | None = None
 
-        if name == ".":
+        if str_name == ".":
             inode = parent_inode
 
-        elif name == "..":
+        elif str_name == "..":
             inode = self._get_row(
                 "SELECT parent_inode FROM inodes WHERE inode=?",
                 (parent_inode,),
@@ -500,42 +541,43 @@ class VirtFS(pyfuse3.Operations):
                 WHERE inodes.parent_inode = ?
                 AND ((playlists.name = ?) OR (tracks.name = ?))
                 """,
-                (parent_inode, name, name),
+                (parent_inode, str_name, str_name),
             )
-        log.debug("Inode %r by name %s", inode, name)
+        log.debug("Inode %r by name %s", inode, str_name)
         return inode
 
     def _get_file_stat_by_inode(self, inode: int) -> FileStat:
-        row = self._get_row("SELECT * FROM inodes WHERE id=?", (inode,))
+        row = self._get_dict_row("SELECT * FROM inodes WHERE id=?", (inode,))
         if row is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
+            raise FUSEError(errno.ENOENT)
 
         entry = FileStat()
 
-        entry.st_ino = inode
+        entry.st_ino = InodeT(inode)
         entry.generation = 0
         entry.entry_timeout = 300
         entry.attr_timeout = 3000
 
-        entry.st_mode = (
+        entry.st_mode = ModeT(
             (stat.S_IFDIR | 0o755) if row["is_dir"] else (stat.S_IFREG | 0o644)
         )
-        entry.st_nlink = 1
-        entry.st_uid = os.getuid()
-        entry.st_gid = os.getgid()
-        entry.st_rdev = 0
-        entry.st_size = (
-            self._get_row(
-                """
+
+        size = self._get_row(
+            """
             SELECT size FROM tracks
             LEFT JOIN inodes ON inodes.reference_id = tracks.id
             WHERE inodes.id=?
             """,
-                (inode,),
-            )
-            if row["is_dir"] == 0
-            else 0
+            (inode,),
         )
+        if size is None and not row["is_dir"]:
+            raise RuntimeError("Should never happen. Size is None!")
+
+        entry.st_nlink = 1
+        entry.st_uid = os.getuid()
+        entry.st_gid = os.getgid()
+        entry.st_rdev = 0
+        entry.st_size = size or 0
         entry.st_blksize = 512
         entry.st_blocks = entry.st_size // entry.st_blksize
 
@@ -556,7 +598,7 @@ class VirtFS(pyfuse3.Operations):
             )
             return
         with suppress(OSError):
-            pyfuse3.invalidate_inode(inode)
+            invalidate_inode(InodeT(inode))
 
     def remove(self, parent_inode: int, inode: int) -> None:
         with self.__db_cursor() as cur:
@@ -566,20 +608,29 @@ class VirtFS(pyfuse3.Operations):
             )
 
     @fail_is_exit
-    async def getattr(self, inode: int, ctx=None) -> FileStat:  # noqa: ANN001, ARG002
+    async def getattr(
+        self,
+        inode: InodeT,
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> EntryAttributes:
         return self._get_file_stat_by_inode(inode)
 
     @fail_is_exit
-    async def lookup(self, parent_inode: int, name: str, ctx=None) -> FileStat:  # noqa: ANN001, ARG002
+    async def lookup(
+        self,
+        parent_inode: InodeT,
+        name: FileNameT,
+        ctx: RequestContext,
+    ) -> EntryAttributes:
         inode = self._get_inode_by_name(parent_inode, name)
         if inode is None:
-            raise pyfuse3.FUSEError(errno.ENOENT)
+            raise FUSEError(errno.ENOENT)
         self._nlookup[inode] += 1
 
-        return await self.getattr(inode)
+        return await self.getattr(inode, ctx)
 
     @fail_is_exit
-    async def forget(self, inode_list: Sequence[tuple[int, int]]) -> None:
+    async def forget(self, inode_list: Sequence[tuple[InodeT, int]]) -> None:
         for inode, count in inode_list:
             if inode not in self._nlookup:
                 continue
@@ -588,30 +639,34 @@ class VirtFS(pyfuse3.Operations):
                 self._nlookup.pop(inode, 0)
 
     @fail_is_exit
-    async def opendir(self, inode: str, ctx=None) -> int:  # noqa: ANN001, ARG002
+    async def opendir(self, inode: InodeT, ctx: RequestContext) -> FileHandleT:  # noqa: ARG002
         fd = self._get_fd()
         self._fd_map_inode[fd].add(inode)
-        return fd
+        return FileHandleT(fd)
 
     @fail_is_exit
-    async def releasedir(self, fd: int) -> None:
+    async def releasedir(self, fd: FileHandleT) -> None:
         inodes = self._fd_map_inode.pop(fd)
         for inode in inodes:
             self.__fd_token_map_offset_read.pop(inode, None)
 
     @fail_is_exit
-    async def statfs(self, ctx=None) -> pyfuse3.StatvfsData:  # noqa: ANN001, ARG002
-        stat_ = pyfuse3.StatvfsData()
+    async def statfs(self, ctx: RequestContext) -> StatvfsData:  # noqa: ARG002
+        stat_ = StatvfsData()
 
         stat_.f_bsize = 512
         stat_.f_frsize = 512
 
         size = self._get_row("SELECT SUM(size) FROM tracks")
+        if size is None:
+            raise RuntimeError("Should never happen. Size is zero!")
         stat_.f_blocks = size // stat_.f_frsize
         stat_.f_bfree = max(size // stat_.f_frsize, 4096)
         stat_.f_bavail = stat_.f_bfree
 
         inodes = self._get_row("SELECT COUNT(id) FROM tracks")
+        if inodes is None:
+            raise RuntimeError("Should never happen. Inodes is zero!")
         stat_.f_files = inodes
         stat_.f_ffree = 0
         stat_.f_favail = stat_.f_ffree
@@ -620,7 +675,7 @@ class VirtFS(pyfuse3.Operations):
 
     @fail_is_exit
     async def readdir(
-        self, fd: int, start_id: int, token: pyfuse3.ReaddirToken
+        self, fd: int, start_id: int, token: ReaddirToken
     ) -> None:
         (dir_inode,) = self._fd_map_inode[fd]
 
@@ -680,10 +735,10 @@ class VirtFS(pyfuse3.Operations):
         dir_list_slice.reverse()
         while len(dir_list_slice) > 0:
             name, inode = dir_list_slice.pop()
-            attr = await self.getattr(inode)
+            attr = await self.getattr(inode, RequestContext())
 
             name = name.replace("/", "-").encode()
-            if not pyfuse3.readdir_reply(
+            if not readdir_reply(
                 token,
                 name,
                 attr,
@@ -694,59 +749,91 @@ class VirtFS(pyfuse3.Operations):
             self._nlookup[inode] += 1
 
     @fail_is_exit
-    async def open(self, inode: int, flags: int, ctx=None) -> pyfuse3.FileInfo:  # noqa: ANN001, ARG002
+    async def open(
+        self,
+        inode: InodeT,
+        flags: FlagT,  # noqa: ARG002
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> FileInfo:
         fd = self._get_fd()
         self._fd_map_inode[fd].add(inode)
 
-        return pyfuse3.FileInfo(fh=fd)
+        return FileInfo(fh=FileHandleT(fd))
 
     @fail_is_exit
     async def release(self, fd: int) -> None:
         self._fd_map_inode.pop(fd)
 
     @fail_is_exit
-    async def unlink(self, inode_p: int, name: bytes, ctx=None) -> None:  # noqa: ANN001, ARG002
-        entry = await self.lookup(inode_p, name)
+    async def unlink(
+        self,
+        parent_inode: InodeT,
+        name: FileNameT,
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> None:
+        entry = await self.lookup(parent_inode, name)
 
         if stat.S_ISDIR(entry.st_mode):
-            raise pyfuse3.FUSEError(errno.EISDIR)
+            raise FUSEError(errno.EISDIR)
 
-        self.remove(inode_p, entry.st_ino)
+        self.remove(parent_inode, entry.st_ino)
 
     @fail_is_exit
-    async def rmdir(self, inode_p: int, name: bytes, ctx=None) -> None:  # noqa: ANN001, ARG002
-        entry = await self.lookup(inode_p, name)
+    async def rmdir(
+        self,
+        parent_inode: InodeT,
+        name: FileNameT,
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> None:
+        entry = await self.lookup(parent_inode, name)
 
         if not stat.S_ISDIR(entry.st_mode):
-            raise pyfuse3.FUSEError(errno.ENOTDIR)
+            raise FUSEError(errno.ENOTDIR)
 
-        self.remove(inode_p, entry.st_ino)
+        self.remove(parent_inode, entry.st_ino)
 
     @fail_is_exit
-    async def access(self, inode: int, mode: int, ctx=None) -> bool:  # noqa: ANN001, ARG002
+    async def access(
+        self,
+        inode: InodeT,  # noqa: ARG002
+        mode: ModeT,  # noqa: ARG002
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> bool:
         return True
 
-    def xattrs(self, inode: int) -> dict[str, Any]:
+    def xattrs(self, inode: InodeT) -> dict[str, Any]:
         return {
             "inode": inode,
             "nlookup": len(self._nlookup),
             "fd_map_inode": len(self._fd_map_inode),
         }
 
-    def _to_flat_map(self, data: dict, sub_key: str = "") -> list[bytes]:
+    def _to_flat_map(
+        self, data: dict[str, Any], sub_key: str = ""
+    ) -> Sequence[XAttrNameT]:
         result = []
         for key, value in data.items():
             if isinstance(value, dict):
-                result.append(f"{key}:dict".encode())
+                result.append(XAttrNameT(f"{key}:dict".encode()))
                 result.extend(self._to_flat_map(value, key))
             else:
-                result.append(f"{sub_key}_{key}:{value}".encode())
+                result.append(XAttrNameT(f"{sub_key}_{key}:{value}".encode()))
         return result
 
     @fail_is_exit
-    async def getxattr(self, inode: int, name: bytes, ctx=None) -> bytes:  # noqa: ANN001, ARG002
-        return self.xattrs(inode).get(name.decode(), "").encode()
+    async def getxattr(
+        self,
+        inode: InodeT,
+        name: XAttrNameT,
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> bytes:
+        result: bytes = self.xattrs(inode).get(name.decode(), "").encode()
+        return result
 
     @fail_is_exit
-    async def listxattr(self, inode: int, ctx=None) -> Sequence[bytes]:  # noqa: ANN001, ARG002
+    async def listxattr(
+        self,
+        inode: InodeT,
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> Sequence[XAttrNameT]:
         return self._to_flat_map(self.xattrs(inode))
