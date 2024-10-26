@@ -260,7 +260,8 @@ class YaMusicFS(VirtFS):
                 track.save_name,
             )
             return
-        if (exists_track := self._get_link_track_by_id(track.id)) is not None:
+
+        for exists_track in self._get_links_track_by_id(track.id):
             if exists_track["parent_inode"] == dir_inode:
                 return
             log.debug(
@@ -270,61 +271,75 @@ class YaMusicFS(VirtFS):
                 track.real_id,
             )
             self._link_track_inode(exists_track["id"], dir_inode)
-        else:
-            log.debug(
-                "Create track %s / %s - %s",
-                track.id,
-                track.save_name,
-                track.real_id,
+            return
+
+        log.debug(
+            "Create track %s / %s - %s",
+            track.id,
+            track.save_name,
+            track.real_id,
+        )
+        if (
+            direct_link := await self._get_or_update_direct_link(
+                track.track_id,
+                track.codec,
+                track.bitrate_in_kbps,
             )
-            if (
-                direct_link := await self._get_or_update_direct_link(
-                    track.track_id,
-                    track.codec,
-                    track.bitrate_in_kbps,
-                )
-            ) is None:
-                log.warning("Track %s is not be downloaded!", track.save_name)
+        ) is None:
+            log.warning("Track %s is not be downloaded!", track.save_name)
+            return
+        async with self._client_session.request(
+            "GET",
+            direct_link,
+        ) as resp:
+            track.size = int(resp.headers["Content-Length"])
+
+            byte = BytesIO()
+            async for chunk in resp.content.iter_chunked(1024):
+                byte.write(chunk)
+                old_size = len(byte.getbuffer())
+                new_buffer = track.tag.to_bytes(byte)
+                if new_buffer is None:
+                    continue
+                tag_size = len(new_buffer) - old_size
+                track.size += tag_size
+
+                break
+
+        if track.save_name.endswith("unknown"):
+            log.warning("Track %s create skip.", track.save_name)
+            return
+
+        tag = track.tag.to_dict()
+        self._create_track(
+            (
+                track.save_name,
+                track.id,
+                track.codec,
+                track.bitrate_in_kbps,
+                track.size,
+                tag["artist"],
+                tag["title"],
+                tag["album"],
+                tag["year"],
+                tag["genre"],
+                tag["duration_ms"],
+            ),
+            dir_inode,
+        )
+
+    def _unlink_track(self, track_id: str, dir_inode: int) -> None:
+        for exists_track in self._get_links_track_by_id(track_id):
+            if exists_track["parent_inode"] != dir_inode:
                 return
-            async with self._client_session.request(
-                "GET",
-                direct_link,
-            ) as resp:
-                track.size = int(resp.headers["Content-Length"])
-
-                byte = BytesIO()
-                async for chunk in resp.content.iter_chunked(1024):
-                    byte.write(chunk)
-                    old_size = len(byte.getbuffer())
-                    new_buffer = track.tag.to_bytes(byte)
-                    if new_buffer is None:
-                        continue
-                    tag_size = len(new_buffer) - old_size
-                    track.size += tag_size
-
-                    break
-
-            if track.save_name.endswith("unknown"):
-                log.warning("Track %s create skip.", track.save_name)
-                return
-
-            tag = track.tag.to_dict()
-            self._create_track(
-                (
-                    track.save_name,
-                    track.id,
-                    track.codec,
-                    track.bitrate_in_kbps,
-                    track.size,
-                    tag["artist"],
-                    tag["title"],
-                    tag["album"],
-                    tag["year"],
-                    tag["genre"],
-                    tag["duration_ms"],
-                ),
+            log.debug(
+                "Unlink track %s, inode: %d, dir_inode: %d",
+                track_id,
+                exists_track["inode"],
                 dir_inode,
             )
+            self.remove(dir_inode, exists_track["inode"])
+            self._invalidate_inode(exists_track["inode"])
 
     @staticmethod
     async def _background_tasks(
@@ -366,12 +381,29 @@ class YaMusicFS(VirtFS):
             return
 
         log.info("Totol like track: %d", len(users_likes_tracks.tracks))
+
+        like_tracks_ids = {track.id for track in users_likes_tracks.tracks}
+        loaded_tracks = self._get_tracks()
         tracks = await users_likes_tracks.fetch_tracks()
 
-        loaded_tracks = self._get_tracks()
+        new_tracks_ids = like_tracks_ids - loaded_tracks.keys()
+        unlink_tracks_ids = loaded_tracks.keys() - like_tracks_ids
+
+        log.debug(
+            "New track like playlist: %d. Remove track: %d",
+            len(new_tracks_ids),
+            len(unlink_tracks_ids),
+        )
+
+        tracks = (
+            await self._ya_player.tracks(list(new_tracks_ids))
+            if new_tracks_ids
+            else []
+        )
 
         tasks = set()
         error_update = False
+
         async for track in self._ya_player.load_tracks(
             tracks,
             exclude_track_ids=set(loaded_tracks.keys()),
@@ -388,6 +420,9 @@ class YaMusicFS(VirtFS):
         while tasks:
             tasks, error = await self._background_tasks(tasks)
             error_update = error or error_update
+
+        for track_id in unlink_tracks_ids:
+            self._unlink_track(track_id, dir_inode)
 
         if not error_update:
             self._update_plyalist(playlist_id, users_likes_tracks.revision)
@@ -446,18 +481,14 @@ class YaMusicFS(VirtFS):
             if ya_track.available:
                 continue
             track = loaded_tracks[ya_track.track_id]
-            # TODO: executemany # noqa: TD002
-            info_track = self._get_link_track_by_id(ya_track.track_id)
-            if info_track is None:
-                continue
-
-            log.warning(
-                "Track %s is not available for listening.",
-                track["name"],
-            )
-
-            self.remove(info_track["parent_inode"], info_track["inode"])
-            self._invalidate_inode(info_track["inode"])
+            for info_track in self._get_links_track_by_id(ya_track.track_id):
+                log.warning(
+                    "Track %s is not available for listening. Cleanup inode %d",
+                    track["name"],
+                    info_track["inode"],
+                )
+                self.remove(info_track["parent_inode"], info_track["inode"])
+                self._invalidate_inode(info_track["inode"])
         log.debug("Cleanup finished.")
 
     async def __fsm(self) -> None:
@@ -485,7 +516,7 @@ class YaMusicFS(VirtFS):
                 track["bitrate"],
             )
         ) is None:
-            log.warning("Track %s is not be downloaded!", track["track_id"])
+            log.warning("Track %s is not be downloaded!", track["name"])
             return None
         return Buffer(direct_link, self._client_session, track)
 
@@ -596,14 +627,19 @@ class YaMusicFS(VirtFS):
             log.exception("Error send feedback:")
 
     def xattrs(self, inode: InodeT) -> dict[str, Any]:
+        track_info = self._get_track_by_inode(inode) or {}
         return {
             "inode": inode,
             "nlookup": len(self._nlookup),
             "fd_map_inode": len(self._fd_map_inode),
-            "tracks": {
+            "queue_invalidate_inode": self.queue_later_invalidate_inode,
+            "track_info": track_info,
+            "stream": {
                 fd: {
                     "name": stream.track["name"],
                     "size": stream.track["size"],
+                    "codec": stream.track["codec"],
+                    "bitrate": stream.track["bitrate"],
                     "play_second": stream.buffer.total_second()
                     if stream.buffer is not None
                     else 0,

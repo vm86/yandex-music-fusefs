@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 import sqlite3
@@ -60,7 +61,6 @@ P = ParamSpec("P")
 T = TypeVar("T")
 
 ROW_DICT_TYPE = dict[str, Any] | None
-ROW_TYPE = int | None
 
 
 # Если возникает исключение в FUSE, то вывоз зависает.
@@ -138,16 +138,15 @@ class VirtFS(Operations):
         file_db = Path.home().joinpath(".cache/yandex-fuse.sqlite3")
         is_new = not file_db.exists()
         self._db = sqlite3.connect(file_db, uri=True)
-
         self._db.row_factory = sqlite3.Row
 
-        self._fd_map_inode: dict[int, set[int]] = defaultdict(set)
+        self._fd_map_inode: dict[int, set[InodeT]] = defaultdict(set)
+        self._nlookup: dict[InodeT, int] = defaultdict(int)
 
-        self._nlookup: dict[int, int] = defaultdict(int)
-
-        self.__fd_token_map_offset_read: dict[int, list[tuple[str, int]]] = (
+        self.__fd_token_read: dict[InodeT, list[tuple[str, InodeT]]] = (
             defaultdict(list)
         )
+        self.__later_invalidate_inode: set[InodeT] = set()
 
         if is_new:
             self.__init_table()
@@ -191,14 +190,19 @@ class VirtFS(Operations):
                 return dict(result)
             return None
 
-    def _get_row(self, query: str, *params: tuple[str | int, ...]) -> ROW_TYPE:
+    def _get_list_row(
+        self, query: str, *params: tuple[str | int, ...]
+    ) -> list[dict[str, Any]]:
+        with self.__db_cursor() as cur:
+            cur.execute(query, *params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def _get_row(self, query: str, *params: tuple[int | str, ...]) -> T | None:
         with self.__db_cursor() as cur:
             cur.execute(query, *params)
             result = cur.fetchone()
             if not result:
                 return None
-            if len(result) > 1:
-                raise RuntimeError("Multi row result!")
             if result:
                 return result[0]  # type: ignore[no-any-return]
             return None
@@ -325,9 +329,9 @@ class VirtFS(Operations):
             (inode,),
         )
 
-    def _get_link_track_by_id(self, track_id: str) -> ROW_DICT_TYPE:
+    def _get_links_track_by_id(self, track_id: str) -> list[dict[str, Any]]:
         # BUG: must return list. reference_id -> many track
-        return self._get_dict_row(
+        return self._get_list_row(
             """
             SELECT
                 inodes.id AS inode,
@@ -518,9 +522,11 @@ class VirtFS(Operations):
             (track_id, direct_link, expired),
         )
 
-    def _get_inode_by_name(self, parent_inode: int, name: bytes) -> int | None:
+    def _get_inode_by_name(
+        self, parent_inode: InodeT, name: bytes
+    ) -> InodeT | None:
         str_name = name.replace(b"\\", b"").decode()
-        inode: int | None = None
+        inode: InodeT | None = None
 
         if str_name == ".":
             inode = parent_inode
@@ -586,9 +592,11 @@ class VirtFS(Operations):
         entry.st_ctime_ns = row["ctime_ns"]
         return entry
 
-    def _invalidate_inode(self, inode: int) -> None:
-        if len(self._fd_map_inode) > 0:
-            return
+    @property
+    def queue_later_invalidate_inode(self) -> set[InodeT]:
+        return self.__later_invalidate_inode
+
+    def _invalidate_inode(self, inode: InodeT) -> None:
         if inode not in self._nlookup:
             return
         if len(self._fd_map_inode) > 0:
@@ -596,9 +604,10 @@ class VirtFS(Operations):
                 "Invalidate inode %d skip. There are open descriptors.",
                 inode,
             )
+            self.__later_invalidate_inode.add(inode)
             return
         with suppress(OSError):
-            invalidate_inode(InodeT(inode))
+            invalidate_inode(inode)
 
     def remove(self, parent_inode: int, inode: int) -> None:
         with self.__db_cursor() as cur:
@@ -648,7 +657,7 @@ class VirtFS(Operations):
     async def releasedir(self, fd: FileHandleT) -> None:
         inodes = self._fd_map_inode.pop(fd)
         for inode in inodes:
-            self.__fd_token_map_offset_read.pop(inode, None)
+            self.__fd_token_read.pop(inode, None)
 
     @fail_is_exit
     async def statfs(self, ctx: RequestContext) -> StatvfsData:  # noqa: ARG002
@@ -679,8 +688,8 @@ class VirtFS(Operations):
     ) -> None:
         (dir_inode,) = self._fd_map_inode[fd]
 
-        if dir_inode in self.__fd_token_map_offset_read:
-            dir_list = self.__fd_token_map_offset_read[dir_inode]
+        if dir_inode in self.__fd_token_read:
+            dir_list = self.__fd_token_read[dir_inode]
         else:
             result = []
             names = set()
@@ -723,9 +732,9 @@ class VirtFS(Operations):
                     names.add(name)
                     result.append((name, row["id"]))
 
-            self.__fd_token_map_offset_read[dir_inode] = dir_list = [
-                (".", 1),
-                ("..", 1),
+            self.__fd_token_read[dir_inode] = dir_list = [
+                (".", InodeT(1)),
+                ("..", InodeT(1)),
                 *result,
             ]
 
@@ -808,16 +817,17 @@ class VirtFS(Operations):
             "fd_map_inode": len(self._fd_map_inode),
         }
 
-    def _to_flat_map(
-        self, data: dict[str, Any], sub_key: str = ""
-    ) -> Sequence[XAttrNameT]:
+    def _to_flat_map(self, data: dict[str, Any]) -> Sequence[XAttrNameT]:
         result = []
+
+        def _set_default(obj: T) -> T | list[Any]:
+            if isinstance(obj, set):
+                return list(obj)
+            return obj
+
         for key, value in data.items():
-            if isinstance(value, dict):
-                result.append(XAttrNameT(f"{key}:dict".encode()))
-                result.extend(self._to_flat_map(value, key))
-            else:
-                result.append(XAttrNameT(f"{sub_key}_{key}:{value}".encode()))
+            data_json = json.dumps(value, default=_set_default)
+            result.append(XAttrNameT(f"{key}:{data_json}".encode()))
         return result
 
     @fail_is_exit
@@ -827,7 +837,9 @@ class VirtFS(Operations):
         name: XAttrNameT,
         ctx: RequestContext,  # noqa: ARG002
     ) -> bytes:
-        result: bytes = self.xattrs(inode).get(name.decode(), "").encode()
+        value = self.xattrs(inode).get(name.decode(), "")
+
+        result, *unused = self._to_flat_map(value)
         return result
 
     @fail_is_exit
