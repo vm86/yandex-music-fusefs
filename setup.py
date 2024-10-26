@@ -43,7 +43,7 @@ def pre_setup() -> None:
     else:
         revisions = get_revisions()
         if revisions:
-            tag, count_commit, _ = version.split("-")
+            tag, count_commit, _ = revisions.split("-")
             major, minor, revision = tag.split(".")
             version = f"{major}.{minor}.dev{count_commit}"
         else:
