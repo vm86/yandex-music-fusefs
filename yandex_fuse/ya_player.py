@@ -46,8 +46,8 @@ def _list_to_str(attr: str, items: list[Any]) -> str:
 
 
 MP4_HEADER_CHUNK_SIZE = 8
-MP3_HEADER_BUFFER_SIZE = 16000
-HEADER_MIN_CHUNK_SIZE = 64
+MP3_HEADER_MIN_SIZE = 16000
+MP4_HEADER_MIN_SIZE = 62835
 
 
 @model
@@ -70,29 +70,26 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
         )
 
     def _to_mp4_tag(self, stream: BytesIO) -> bytes | None:
-        length = 0
         tag = {}
-        while stream.tell() < len(stream.getbuffer()):
-            data = stream.read(MP4_HEADER_CHUNK_SIZE)
+        tag_stream = BytesIO()
+
+        while data := stream.read(MP4_HEADER_CHUNK_SIZE):
             if len(data) != MP4_HEADER_CHUNK_SIZE:
-                return None
+                break
             atom_length, atom_name = struct.unpack(">I4s", data)
             tag[atom_name] = (atom_length, stream.tell())
             if atom_name == b"mdat":
                 break
-            length += atom_length
-            stream.seek(length)
-        if b"mdat" not in tag:
+            tag_stream.write(data)
+            tag_stream.write(stream.read(atom_length - MP4_HEADER_CHUNK_SIZE))
+        if {b"mdat", b"moov"} & tag.keys() != {b"mdat", b"moov"}:
             return None
-
-        tag_stream = BytesIO()
-        stream.seek(0)
-        tag_stream.write(stream.read(length))
 
         audiofile = MP4(fileobj=tag_stream)  # type: ignore[no-untyped-call]
         audiofile.delete(fileobj=tag_stream)
         if audiofile.tags is None:
             audiofile.add_tags()  # type: ignore[no-untyped-call]
+
         # https://mutagen.readthedocs.io/en/latest/api/mp4.html#mutagen.mp4.MP4Tags
         audiofile["\xa9nam"] = self.title
         audiofile["\xa9alb"] = self.album
@@ -105,26 +102,22 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
 
         stream.seek(0)
         tag_stream.seek(0)
-        length = 0
 
         new_stream = BytesIO()
-        while tag_stream.tell() < len(tag_stream.getbuffer()):
-            atom_length, atom_name = struct.unpack(">I4s", tag_stream.read(8))
-            new_stream.write(struct.pack(">I4s", atom_length, atom_name))
-            new_stream.write(tag_stream.read(atom_length))
-
-            length += atom_length
+        while data := tag_stream.read(MP4_HEADER_CHUNK_SIZE):
+            atom_length, atom_name = struct.unpack(">I4s", data)
+            new_stream.write(data)
+            new_stream.write(
+                tag_stream.read(atom_length - MP4_HEADER_CHUNK_SIZE)
+            )
 
         atom_length, seek = tag[b"mdat"]
-        stream.seek(seek - 8)
+        stream.seek(seek - MP4_HEADER_CHUNK_SIZE)
         new_stream.write(stream.read())
 
         return bytes(new_stream.getbuffer())
 
     def _to_mp3_tag(self, stream: BytesIO) -> bytes | None:
-        if len(stream.getbuffer()) < MP3_HEADER_BUFFER_SIZE:
-            return None
-
         new_stream = BytesIO()
         new_stream.write(stream.read())
 
@@ -136,7 +129,7 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
         audiofile["TIT2"] = TIT2(encoding=3, text=self.title)  # type: ignore[no-untyped-call]
         audiofile["TPE1"] = TPE1(encoding=3, text=self.artist)  # type: ignore[no-untyped-call]
         audiofile["TALB"] = TALB(encoding=3, text=self.album)  # type: ignore[no-untyped-call]
-        audiofile["TYER"] = TYER(encoding=3, text=self.year)  # type: ignore[no-untyped-call]
+        audiofile["TYE"] = TYER(encoding=3, text=self.year)  # type: ignore[no-untyped-call]
         audiofile["TCON"] = TCON(encoding=3, text=self.genre)  # type: ignore[no-untyped-call]
         audiofile["TLEN"] = TLEN(encoding=3, text=str(self.duration_ms))  # type: ignore[no-untyped-call]
 
@@ -146,16 +139,22 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
         return bytes(new_stream.getbuffer())
 
     def to_bytes(self, stream: BytesIO) -> bytes | None:
-        if len(stream.getbuffer()) < HEADER_MIN_CHUNK_SIZE:
-            return None
+        buffer = bytearray(stream.getbuffer())
+
         current_offset = stream.tell()
         stream.seek(0)
 
         try:
-            if MP4.score(None, None, bytes(stream.getbuffer())):  # type: ignore[no-untyped-call]
-                return self._to_mp4_tag(stream)
-            if MP3.score("", None, bytes(stream.getbuffer())):  # type: ignore[no-untyped-call]
+            if len(buffer) <= MP3_HEADER_MIN_SIZE:
+                return None
+            if MP3.score("", None, buffer):  # type: ignore[no-untyped-call]
                 return self._to_mp3_tag(stream)
+
+            if len(buffer) <= MP4_HEADER_MIN_SIZE:
+                return None
+            if MP4.score(None, None, buffer):  # type: ignore[no-untyped-call]
+                return self._to_mp4_tag(stream)
+
         finally:
             stream.seek(current_offset)
         return bytes(stream.getbuffer())
