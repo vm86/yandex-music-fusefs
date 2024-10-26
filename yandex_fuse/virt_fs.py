@@ -778,9 +778,9 @@ class VirtFS(Operations):
         self,
         parent_inode: InodeT,
         name: FileNameT,
-        ctx: RequestContext,  # noqa: ARG002
+        ctx: RequestContext,
     ) -> None:
-        entry = await self.lookup(parent_inode, name)
+        entry = await self.lookup(parent_inode, name, ctx)
 
         if stat.S_ISDIR(entry.st_mode):
             raise FUSEError(errno.EISDIR)
