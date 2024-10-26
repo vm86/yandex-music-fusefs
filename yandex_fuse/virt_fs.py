@@ -652,26 +652,26 @@ class VirtFS(Operations):
 
     @fail_is_exit
     async def statfs(self, ctx: RequestContext) -> StatvfsData:  # noqa: ARG002
-        stat_ = StatvfsData()
+        stat = StatvfsData()
 
-        stat_.f_bsize = 512
-        stat_.f_frsize = 512
+        stat.f_bsize = 512
+        stat.f_frsize = 512
 
-        size = self._get_row("SELECT SUM(size) FROM tracks")
-        if size is None:
-            raise RuntimeError("Should never happen. Size is zero!")
-        stat_.f_blocks = size // stat_.f_frsize
-        stat_.f_bfree = max(size // stat_.f_frsize, 4096)
-        stat_.f_bavail = stat_.f_bfree
+        max_size = 2**40
+        size = self._get_row("SELECT SUM(size) FROM tracks") or 0
 
-        inodes = self._get_row("SELECT COUNT(id) FROM tracks")
-        if inodes is None:
-            raise RuntimeError("Should never happen. Inodes is zero!")
-        stat_.f_files = inodes
-        stat_.f_ffree = 0
-        stat_.f_favail = stat_.f_ffree
+        stat.f_blocks = max_size // stat.f_bsize
+        stat.f_bfree = (max_size - size) // stat.f_frsize
+        stat.f_bavail = stat.f_bfree
 
-        return stat_
+        max_inodes = 2**32
+        inodes = self._get_row("SELECT COUNT(id) FROM inodes") or 0
+
+        stat.f_files = max_inodes
+        stat.f_ffree = max_inodes - inodes
+        stat.f_favail = stat.f_ffree
+
+        return stat
 
     @fail_is_exit
     async def readdir(
