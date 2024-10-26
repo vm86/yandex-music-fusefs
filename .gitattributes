@@ -1,0 +1,2 @@
+tests/contrib/test.m4a filter=lfs diff=lfs merge=lfs -text
+tests/contrib/test.mp3 filter=lfs diff=lfs merge=lfs -text
