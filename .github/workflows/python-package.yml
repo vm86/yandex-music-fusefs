@@ -19,10 +19,8 @@ jobs:
         contents: write
     steps:
     - uses: actions/checkout@v4
-    - run: |
-        date > generated.txt
-        git tag -l --contains HEAD > TAG
-        git describe --tags > REVISIONS || echo > REVISIONS
+      with:
+        lfs: true
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
@@ -31,14 +29,22 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install build ruff mypy
-        sudo apt install fuse3 libfuse3-dev libfuse-dev -y
-        python -m pip install -e .
-    - name: Lint with ruff
+        sudo apt install fuse3 libfuse3-dev libfuse-dev ffmpeg -y
+        python -m pip install -e ".[lint]"
+    - name: Test with pytest
       run: |
-        ruff check
-    - name: Lint with mypy
+        python -m pip install -e ".[test]"
+        pytest
+    - name: Lint code with Ruff
+      run: |
+        ruff check --output-format=github
+    - name: Check code formatting with Ruff
+      run: |
+        ruff format --diff
+    - name: Lint code with mypy
       run: |
         mypy yandex_fuse
+        mypy tests
     - name: Build package
       run: python -m build
     - name: Release
