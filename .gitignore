@@ -1,4 +1,4 @@
-# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized
 .idea
 *.iml
 __pycache__/
@@ -50,4 +50,7 @@ ENV/
 # ruff
 .ruff_cache
 
-VERSION
+yandex_fuse/_version.py
+
+# coverage
+*.coverage

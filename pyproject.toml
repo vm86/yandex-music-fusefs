@@ -1,0 +1,92 @@
+[build-system]
+requires = ["setuptools >= 65.0", "setuptools-scm >= 8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yandex-fuse"
+dynamic = ["version"]
+description = "Yandex Music Fuse FS"
+readme = "README.md"
+authors = [{ name = "Roman Nebaluev" }]
+license = { text = "LGPLv3" }
+keywords = ["yandex", "music", "fuse", "filesystem"]
+
+dependencies = ["yandex-music >=2.2.0", "mutagen >=1.47.0", "pyfuse3 >=3.4.0"]
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+test = ["pytest", "coverage", "pytest-cov"]
+lint = ["mypy", "ruff"]
+
+[project.scripts]
+yamusic-fs = "yandex_fuse.main:main"
+
+[tool.setuptools]
+zip-safe = false
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["yandex_fuse"]
+
+[tool.setuptools.package-data]
+"yandex_fuse" = ["contrib/*"]
+
+[tool.setuptools_scm]
+version_file = "yandex_fuse/_version.py"
+
+[tool.pytest.ini_options]
+pythonpath = "yandex_fuse"
+addopts = "--cov --cov-report term-missing:skip-covered -v -s"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 80
+indent-width = 4
+
+[tool.ruff.lint]
+# https://docs.astral.sh/ruff/rules/#legend
+select = ["ALL"]
+# D10* Missing docstring
+ignore = [
+    "D10",
+    "D204",
+    "D203",
+    "D211",
+    "D212",
+    "D213",
+    "EM101",
+    "EM102",
+    "ERA001",
+    "FBT002",
+    "FBT003",
+    "FIX002",
+    "PT001",
+    "PT023",
+    "Q001",
+    "TD003",
+    "TRY003",
+    "COM812",
+    "ISC001",
+    "S603",
+    "S607",
+]
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = '^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$'
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "double"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = false
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = true
+warn_return_any = true
+warn_unreachable = true
+strict_equality = true
+strict = true
+pretty = true
