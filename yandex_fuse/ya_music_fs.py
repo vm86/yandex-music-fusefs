@@ -55,8 +55,6 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_TAGGING = True
-
 LIMIT_TASKS = 5
 LIMIT_ONYOURWAVE = 200
 
@@ -114,7 +112,7 @@ class Buffer:
         self.__download_task: Task[Any] | None = create_task(
             self.download(), name="download"
         )
-        self.__tagging = not _TAGGING
+        self.__tagging = False
         self.__ready_read = Event()
 
     def __del__(self) -> None:
@@ -294,18 +292,17 @@ class YaMusicFS(VirtFS):
             ) as resp:
                 track.size = int(resp.headers["Content-Length"])
 
-                if _TAGGING:
-                    byte = BytesIO()
-                    async for chunk in resp.content.iter_chunked(1024):
-                        byte.write(chunk)
-                        old_size = len(byte.getbuffer())
-                        new_buffer = track.tag.to_bytes(byte)
-                        if new_buffer is None:
-                            continue
-                        tag_size = len(new_buffer) - old_size
-                        track.size += tag_size
+                byte = BytesIO()
+                async for chunk in resp.content.iter_chunked(1024):
+                    byte.write(chunk)
+                    old_size = len(byte.getbuffer())
+                    new_buffer = track.tag.to_bytes(byte)
+                    if new_buffer is None:
+                        continue
+                    tag_size = len(new_buffer) - old_size
+                    track.size += tag_size
 
-                        break
+                    break
 
             if track.save_name.endswith("unknown"):
                 log.warning("Track %s create skip.", track.save_name)
