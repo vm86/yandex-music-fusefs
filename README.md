@@ -20,6 +20,13 @@ sudo apt install pkg-config fuse3 libfuse3-dev libfuse-dev -y
 
 ```shell
 sudo dnf install pkg-config fuse3 fuse3-devel python3-devel gcc -y
+
+```
+
+#### user_allow_other
+
+```shell
+fusermount3: option allow_other only allowed if 'user_allow_other' is set in /etc/fuse.conf
 ```
 
 ### Установка
