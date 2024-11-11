@@ -69,6 +69,7 @@ class TestTag:
             assert m4a_parital.tell() == last_seek
 
         m4a_parital.seek(0)
+
         assert m4a_wtihout_tag.getvalue() == m4a_parital.getvalue()
 
     def test_tag_mp3(self, tag: TrackTag, mp3_wtihout_tag: BytesIO) -> None:
