@@ -15,7 +15,7 @@ dependencies = ["yandex-music >=2.2.0", "mutagen >=1.47.0", "pyfuse3 >=3.4.0"]
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-test = ["pytest", "coverage", "pytest-cov"]
+test = ["pytest", "pytest-asyncio", "pytest-mock", "coverage", "pytest-cov"]
 lint = ["mypy", "ruff"]
 
 [project.scripts]
@@ -38,6 +38,7 @@ version_file = "yandex_fuse/_version.py"
 pythonpath = "yandex_fuse"
 addopts = "--cov --cov-report term-missing:skip-covered -v -s"
 testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "session"
 
 [tool.ruff]
 target-version = "py310"
@@ -63,6 +64,7 @@ ignore = [
     "FIX002",
     "PT001",
     "PT023",
+    "PLR0913",
     "Q001",
     "TD003",
     "TRY003",

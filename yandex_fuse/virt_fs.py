@@ -10,7 +10,7 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager, suppress
-from pathlib import Path
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 from pyfuse3 import (
@@ -70,7 +70,8 @@ def fail_is_exit(
     async def wrapped(*args: P.args, **kwargs: P.kwargs) -> T:
         try:
             return await func(*args, **kwargs)
-        except FUSEError:
+        except FUSEError as error:
+            log.debug("FUSEError %r: %s", func, str(error))
             raise
         except Exception:
             log.exception("Error %r", func)
@@ -79,55 +80,98 @@ def fail_is_exit(
     return wrapped
 
 
+@dataclass
+class SQLRow:
+    __tablename__ = ""
+
+    def insert(self) -> tuple[str, dict[str, Any]]:
+        data = self.__dict__
+        if data.get("id") is None:
+            data.pop("id", None)
+
+        columns = ", ".join(data.keys())
+        placeholders = ":" + ", :".join(data.keys())
+        query = f"""
+        INSERT INTO {self.__tablename__}
+        ({columns})
+        VALUES
+        '({placeholders})'
+        """
+        return query, data
+
+    @classmethod
+    def from_row(cls: type[T], row: dict[str, Any] | None) -> T | None:
+        if row is None:
+            return None
+        return cls(**row)
+
+
+@dataclass
+class Inode(SQLRow):
+    __tablename__ = "inodes"
+
+    uid: int
+    gid: int
+    mode: ModeT
+    mtime_ns: int
+    atime_ns: int
+    ctime_ns: int
+    target: bytes
+    size: int = 0
+    rdev: int = 0
+
+    id: int | None = None
+
+
+@dataclass
+class Dentry(SQLRow):
+    __tablename__ = "dentrys"
+
+    name: bytes
+    inode: InodeT
+    parent_inode: InodeT
+    rowid: int | None = None
+    data: bytes = b""
+
+
 class VirtFS(Operations):
-    CREATE_TABLE_QUERYS = (
+    FILE_DB = "file::memory:?cache=shared"
+
+    CREATE_TABLE_QUERYS: tuple[str, ...] = (
         """
-        CREATE TABLE inodes (
-            id           INTEGER PRIMARY KEY,
-            parent_inode INTEGER NOT NULL,
-            type         TEXT(255),
-            is_dir       TINYINT NOT NULL,
-            mtime_ns     INT NOT NULL,
-            atime_ns     INT NOT NULL,
-            ctime_ns     INT NOT NULL,
-            reference_id INTEGER,
-            UNIQUE       (parent_inode, reference_id)
-        )
+        PRAGMA foreign_keys=ON;
         """,
         """
-        CREATE TABLE tracks (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            name         BLOB(256) NOT NULL,
-            track_id     TEXT(255) NOT NULL UNIQUE,
-            codec        BLOB(8) NOT NULL,
-            bitrate      INT NOT NULL,
-            size         INT NOT NULL,
-            artist       TEXT(255),
-            title        TEXT(255),
-            album        TEXT(255),
-            year         TEXT(255),
-            genre        TEXT(255),
-            duration_ms  INT,
-            UNIQUE       (name, track_id)
-        )
+        CREATE TABLE IF NOT EXISTS inodes (
+            id        INTEGER PRIMARY KEY,
+            uid       INT NOT NULL,
+            gid       INT NOT NULL,
+            mode      INT NOT NULL,
+            mtime_ns  INT NOT NULL,
+            atime_ns  INT NOT NULL,
+            ctime_ns  INT NOT NULL,
+            target    BLOB(256),
+            size      INT NOT NULL DEFAULT 0,
+            rdev      INT NOT NULL DEFAULT 0
+        );
         """,
         """
-        CREATE TABLE playlists (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            playlist_id  TEXT(255) NOT NULL UNIQUE,
-            station_id   TEXT(255),
-            batch_id     TEXT(255),
-            revision     INT DEFAULT 0,
-            name         TEXT(255) NOT NULL
-        )
+        CREATE TABLE IF NOT EXISTS dentrys (
+            rowid     INTEGER PRIMARY KEY AUTOINCREMENT,
+            name      BLOB(256) NOT NULL,
+            inode     INT NOT NULL
+                REFERENCES inodes(id) ON DELETE CASCADE,
+            parent_inode INT NOT NULL
+                REFERENCES inodes(id) ON DELETE RESTRICT,
+            data      BLOB,
+            UNIQUE (name, parent_inode)
+        );
         """,
         """
-        CREATE TABLE direct_link (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            track_id   TEXT(255) NOT NULL REFERENCES tracks(track_id) UNIQUE,
-            link       BLOB(256) NOT NULL,
-            expired    INT NOT NULL
-        )
+        INSERT OR IGNORE INTO inodes VALUES (1,0,0,16877,0,0,0,X'',0,0);
+        """,
+        """
+        INSERT OR IGNORE INTO dentrys VALUES(1,X'2e2e',1,1,X'');
         """,
     )
 
@@ -135,55 +179,51 @@ class VirtFS(Operations):
 
     def __init__(self) -> None:
         super().__init__()
-        file_db = Path.home().joinpath(".cache/yandex-fuse.sqlite3")
-        is_new = not file_db.exists()
-        self._db = sqlite3.connect(file_db, uri=True)
+
+        self._db = sqlite3.connect(
+            self.FILE_DB, isolation_level="IMMEDIATE", uri=True
+        )
         self._db.row_factory = sqlite3.Row
 
-        self._fd_map_inode: dict[int, set[InodeT]] = defaultdict(set)
+        self._fd_map_inode: dict[int, InodeT] = {}
         self._nlookup: dict[InodeT, int] = defaultdict(int)
 
-        self.__fd_token_read: dict[InodeT, list[tuple[str, InodeT]]] = (
+        self.__fd_token_read: dict[InodeT, list[tuple[bytes, InodeT]]] = (
             defaultdict(list)
         )
         self.__later_invalidate_inode: set[InodeT] = set()
 
-        if is_new:
-            self.__init_table()
+        self._open_cur = 0
+        self.__init_table()
 
     @contextmanager
-    def __db_cursor(self) -> Iterator[sqlite3.Cursor]:
-        with self._db:
-            yield self._db.cursor()
+    def _db_cursor(self) -> Iterator[sqlite3.Cursor]:
+        self._open_cur += 1
+        try:
+            with self._db:
+                yield self._db.cursor()
+        finally:
+            self._open_cur -= 1
 
     def __init_table(self) -> None:
-        with self.__db_cursor() as cur:
+        with self._db_cursor() as cur:
             log.debug("Init database.")
 
             for create_table_query in self.CREATE_TABLE_QUERYS:
                 cur.execute(create_table_query)
 
-            # Insert root directory
-            now_ns = int(time.time() * 1e9)
-            cur.execute(
-                "INSERT INTO inodes"
-                "(id, parent_inode, type, is_dir, mtime_ns, atime_ns, ctime_ns)"
-                "VALUES (?,?,?,?,?,?,?)",
-                (
-                    self.ROOT_INODE,
-                    0,
-                    "ROOT",
-                    1,
-                    now_ns,
-                    now_ns,
-                    now_ns,
-                ),
-            )
+    def _get_int_row(self, query: str, *params: tuple[str | int, ...]) -> int:
+        with self._db_cursor() as cur:
+            cur.execute(query, *params)
+            result = cur.fetchone()
+            if result:
+                return int(*result)
+            return 0
 
     def _get_dict_row(
-        self, query: str, *params: tuple[str | int, ...]
+        self, query: str, *params: tuple[Any, ...]
     ) -> ROW_DICT_TYPE:
-        with self.__db_cursor() as cur:
+        with self._db_cursor() as cur:
             cur.execute(query, *params)
             result = cur.fetchone()
             if result:
@@ -193,19 +233,9 @@ class VirtFS(Operations):
     def _get_list_row(
         self, query: str, *params: tuple[str | int, ...]
     ) -> list[dict[str, Any]]:
-        with self.__db_cursor() as cur:
+        with self._db_cursor() as cur:
             cur.execute(query, *params)
             return [dict(row) for row in cur.fetchall()]
-
-    def _get_row(self, query: str, *params: tuple[int | str, ...]) -> T | None:
-        with self.__db_cursor() as cur:
-            cur.execute(query, *params)
-            result = cur.fetchone()
-            if not result:
-                return None
-            if result:
-                return result[0]  # type: ignore[no-any-return]
-            return None
 
     def _get_fd(self) -> int:
         for i in range(2048):
@@ -215,382 +245,77 @@ class VirtFS(Operations):
             return i
         raise FUSEError(errno.ENOENT)
 
-    def _create_plyalist(self, name: str, uid: str) -> int:
-        with self.__db_cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO playlists (name, playlist_id)
-                VALUES (?, ?)
-            """,
-                (
-                    name,
-                    uid,
-                ),
-            )
-            row_id = cur.lastrowid
-            now_ns = int(time.time() * 1e9)
-
-            cur.execute(
-                """
-                INSERT INTO inodes
-                (
-                    type,
-                    parent_inode,
-                    is_dir,
-                    mtime_ns,
-                    atime_ns,
-                    ctime_ns,
-                    reference_id
-                )
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    "PLAYLIST",
-                    self.ROOT_INODE,
-                    1,
-                    now_ns,
-                    now_ns,
-                    now_ns,
-                    row_id,
-                ),
-            )
-            if cur.lastrowid is None:
-                raise RuntimeError("Should never happen. lastrowid is None.")
-            return cur.lastrowid
-
-    def _update_plyalist(
-        self,
-        uid: str,
-        revision: int,
-        batch_id: str | None = None,
-    ) -> None:
-        now_ns = int(time.time() * 1e9)
-
-        with self.__db_cursor() as cur:
-            cur.execute(
-                """
-                UPDATE playlists SET revision=?,batch_id=? WHERE playlist_id=?;
-            """,
-                (
-                    revision,
-                    batch_id,
-                    uid,
-                ),
-            )
-
-            cur.execute(
-                """
-                UPDATE inodes
-                SET mtime_ns=?
-                WHERE inodes.reference_id=(
-                    SELECT id FROM playlists WHERE playlist_id=?
-                )
-                AND inodes.type = 'PLAYLIST';
-            """,
-                (
-                    now_ns,
-                    uid,
-                ),
-            )
-
-    def _get_playlist_by_id(self, uid: str) -> ROW_DICT_TYPE:
-        return self._get_dict_row(
-            """
-            SELECT
-                inodes.id AS inode_id,
-                playlists.station_id AS station_id,
-                playlists.batch_id AS batch_id,
-                playlists.revision AS revision,
-                playlists.name AS name
-            FROM playlists
-            INNER JOIN inodes ON inodes.reference_id = playlists.id
-            WHERE
-                playlists.playlist_id = ?
-                AND inodes.type = 'PLAYLIST';
-            """,
-            (uid,),
-        )
-
-    def _get_playlist_by_inode(self, inode: int) -> ROW_DICT_TYPE:
-        return self._get_dict_row(
-            """
-            SELECT
-                inodes.id AS inode_id,
-                playlists.station_id AS station_id,
-                playlists.batch_id AS batch_id,
-                playlists.revision AS revision,
-                playlists.name AS name
-            FROM playlists
-            INNER JOIN inodes ON inodes.reference_id = playlists.id
-            WHERE
-                inodes.id = ?
-                AND inodes.type = 'PLAYLIST';
-            """,
-            (inode,),
-        )
-
-    def _get_links_track_by_id(self, track_id: str) -> list[dict[str, Any]]:
-        # BUG: must return list. reference_id -> many track
-        return self._get_list_row(
-            """
-            SELECT
-                inodes.id AS inode,
-                inodes.parent_inode as parent_inode,
-                tracks.id AS id
-            FROM tracks
-            LEFT JOIN inodes ON inodes.reference_id = tracks.id
-            WHERE tracks.track_id = ?
-                AND inodes.type = 'TRACK';
-            """,
-            (track_id,),
-        )
-
-    def _get_track_by_inode(self, inode: int) -> ROW_DICT_TYPE:
-        return self._get_dict_row(
-            """
-            SELECT
-                *
-            FROM tracks
-            LEFT JOIN inodes ON inodes.reference_id = tracks.id
-            WHERE inodes.id=?
-                AND inodes.type = 'TRACK';
-            """,
-            (inode,),
-        )
-
-    def _get_tracks_by_parent_inode(
-        self, parent_inode: int
-    ) -> list[ROW_DICT_TYPE]:
-        with self.__db_cursor() as cur:
-            cur.execute(
-                """
-            SELECT
-                *
-            FROM tracks
-            LEFT JOIN inodes ON inodes.reference_id = tracks.id
-            WHERE inodes.parent_inode=?
-                AND inodes.type = 'TRACK';
-            """,
-                (parent_inode,),
-            )
-            return list(cur.fetchall())
-
-    def _create_track(
-        self, track: tuple[Any, ...], parent_inode: int = -1
-    ) -> None:
-        with self.__db_cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO tracks
-                (
-                    name,
-                    track_id,
-                    codec,
-                    bitrate,
-                    size,
-                    artist,
-                    title,
-                    album,
-                    year,
-                    genre,
-                    duration_ms
-                )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-                track,
-            )
-            row_id = cur.lastrowid
-            now_ns = int(time.time() * 1e9)
-
-            cur.execute(
-                """
-                INSERT INTO inodes
-                (
-                    type,
-                    parent_inode,
-                    is_dir,
-                    mtime_ns,
-                    atime_ns,
-                    ctime_ns,
-                    reference_id
-                )
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    "TRACK",
-                    parent_inode,
-                    0,
-                    now_ns,
-                    now_ns,
-                    now_ns,
-                    row_id,
-                ),
-            )
-
-    def _link_track_inode(self, track_id: int, dir_inode: int) -> None:
-        now_ns = int(time.time() * 1e9)
-        with self.__db_cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO inodes
-                (
-                    type,
-                    parent_inode,
-                    is_dir,
-                    mtime_ns,
-                    atime_ns,
-                    ctime_ns,
-                    reference_id
-                )
-                VALUES (?,?,?,?,?,?,?)
-                """,
-                (
-                    "TRACK",
-                    dir_inode,
-                    0,
-                    now_ns,
-                    now_ns,
-                    now_ns,
-                    track_id,
-                ),
-            )
-
-    def _get_tracks(self) -> dict[str, Any]:
-        result = {}
-        with self.__db_cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    tracks.name AS name,
-                    tracks.track_id AS track_id,
-                    tracks.codec AS codec,
-                    tracks.bitrate AS bitrate,
-                    tracks.size AS size,
-                    tracks.artist AS tag_artist,
-                    tracks.title AS tag_title,
-                    tracks.album AS tag_album,
-                    tracks.year AS tag_year,
-                    tracks.genre AS tag_genre,
-                    tracks.duration_ms AS tag_duration_ms
-                FROM tracks
-                ORDER BY track_id
-                """,
-            )
-
-            for row in cur.fetchall():
-                result[row["track_id"]] = dict(row)
+    @property
+    def _inode_map_fd(self) -> dict[InodeT, set[int]]:
+        result = defaultdict(set)
+        for fd, inode in self._fd_map_inode.items():
+            result[inode].add(fd)
         return result
 
-    @contextmanager
-    def _get_direct_link(
-        self, track_id: str
-    ) -> Iterator[tuple[str | None, sqlite3.Cursor]]:
-        with self.__db_cursor() as cur:
-            cur.execute(
-                "SELECT * FROM direct_link WHERE track_id=?",
-                (track_id,),
-            )
-            row = cur.fetchone()
-
-            if row is None:
-                yield (None, cur)
-                return
-            expired = int(time.time() * 1e9)
-            if row["expired"] > expired:
-                log.debug(
-                    "Track %s, lifetime %r",
-                    track_id,
-                    (row["expired"] - expired) / 1e9,
-                )
-                yield (row["link"], cur)
-                return
-            log.debug("Direct link %s direct link has expired", track_id)
-            cur.execute("DELETE FROM direct_link WHERE track_id=?", (track_id,))
-            yield (None, cur)
-
-    def _insert_direct_link(
-        self, cur: sqlite3.Cursor, track_id: str, direct_link: str
-    ) -> None:
-        expired = int((time.time() + 8600) * 1e9)
-        cur.execute(
-            """
-            INSERT INTO direct_link
-            (track_id, link, expired)
-            VALUES(?, ?, ?)
-            ON CONFLICT(track_id) DO NOTHING
-            """,
-            (track_id, direct_link, expired),
+    def _get_file_stat_by_inode(self, inode: InodeT) -> FileStat:
+        inode_row = Inode.from_row(
+            self._get_dict_row("SELECT * FROM inodes WHERE id=?", (inode,))
         )
 
-    def _get_inode_by_name(
-        self, parent_inode: InodeT, name: bytes
-    ) -> InodeT | None:
-        str_name = name.replace(b"\\", b"").decode()
-        inode: InodeT | None = None
-
-        if str_name == ".":
-            inode = parent_inode
-
-        elif str_name == "..":
-            inode = self._get_row(
-                "SELECT parent_inode FROM inodes WHERE inode=?",
-                (parent_inode,),
-            )
-        else:
-            inode = self._get_row(
-                """
-                SELECT
-                    inodes.id
-                FROM inodes
-                LEFT JOIN playlists ON playlists.id = inodes.reference_id
-                LEFT JOIN tracks ON tracks.id = inodes.reference_id
-                WHERE inodes.parent_inode = ?
-                AND ((playlists.name = ?) OR (tracks.name = ?))
-                """,
-                (parent_inode, str_name, str_name),
-            )
-        log.debug("Inode %r by name %s", inode, str_name)
-        return inode
-
-    def _get_file_stat_by_inode(self, inode: int) -> FileStat:
-        row = self._get_dict_row("SELECT * FROM inodes WHERE id=?", (inode,))
-        if row is None:
+        if inode_row is None:
             raise FUSEError(errno.ENOENT)
 
         entry = FileStat()
 
-        entry.st_ino = InodeT(inode)
+        entry.st_ino = inode
         entry.generation = 0
         entry.entry_timeout = 300
         entry.attr_timeout = 3000
 
-        entry.st_mode = ModeT(
-            (stat.S_IFDIR | 0o755) if row["is_dir"] else (stat.S_IFREG | 0o644)
+        entry.st_mode = inode_row.mode
+
+        entry.st_nlink = self._get_int_row(
+            "SELECT COUNT(inode) FROM dentrys WHERE inode=?", (inode,)
         )
 
-        size = self._get_row(
-            """
-            SELECT size FROM tracks
-            LEFT JOIN inodes ON inodes.reference_id = tracks.id
-            WHERE inodes.id=?
-            """,
-            (inode,),
-        )
-        if size is None and not row["is_dir"]:
-            raise RuntimeError("Should never happen. Size is None!")
-
-        entry.st_nlink = 1
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0
-        entry.st_size = size or 0
+        entry.st_size = inode_row.size
         entry.st_blksize = 512
         entry.st_blocks = entry.st_size // entry.st_blksize
 
-        entry.st_atime_ns = row["atime_ns"]
-        entry.st_mtime_ns = row["mtime_ns"]
-        entry.st_ctime_ns = row["ctime_ns"]
+        entry.st_atime_ns = inode_row.atime_ns
+        entry.st_mtime_ns = inode_row.mtime_ns
+        entry.st_ctime_ns = inode_row.ctime_ns
         return entry
+
+    def _get_inode_by_name(
+        self, parent_inode: InodeT, name: bytes
+    ) -> InodeT | None:
+        str_name = name.replace(b"\\", b"")
+        inode: InodeT | None = None
+
+        if str_name == b".":
+            return parent_inode
+
+        if str_name == b"..":
+            dentry = Dentry.from_row(
+                self._get_dict_row(
+                    "SELECT * FROM dentrys WHERE inode=?", (parent_inode,)
+                )
+            )
+            if dentry is not None:
+                return dentry.parent_inode
+        dentry = Dentry.from_row(
+            self._get_dict_row(
+                "SELECT * FROM dentrys WHERE name=? AND parent_inode=?",
+                (
+                    name,
+                    parent_inode,
+                ),
+            )
+        )
+        if dentry:
+            log.debug("Inode %s by name %s", inode, str_name.decode())
+            return dentry.inode
+        log.debug("Inode by name %s not found.", str_name.decode())
+        return None
 
     @property
     def queue_later_invalidate_inode(self) -> set[InodeT]:
@@ -609,12 +334,65 @@ class VirtFS(Operations):
         with suppress(OSError):
             invalidate_inode(inode)
 
-    def remove(self, parent_inode: int, inode: int) -> None:
-        with self.__db_cursor() as cur:
+    def _create(
+        self,
+        *,
+        parent_inode: InodeT,
+        name: bytes,
+        size: int,
+        mode: int,
+        target: bytes,
+        db_cursor: sqlite3.Cursor,
+    ) -> InodeT:
+        now_ns = int(time.time() * 1e9)
+
+        inode_object = Inode(
+            mode=ModeT(mode),
+            target=target,
+            uid=0,
+            gid=0,
+            size=size,
+            mtime_ns=now_ns,
+            atime_ns=now_ns,
+            ctime_ns=now_ns,
+        )
+        db_cursor.execute(*inode_object.insert())
+        if db_cursor.lastrowid is None:
+            raise RuntimeError("Lastrowid is none!")
+
+        inode = InodeT(db_cursor.lastrowid)
+        dentry_object = Dentry(
+            parent_inode=parent_inode,
+            inode=inode,
+            name=name,
+        )
+        db_cursor.execute(*dentry_object.insert())
+        if stat.S_ISDIR(inode_object.mode):
+            dentry_object_dot_dot = Dentry(
+                parent_inode=inode,
+                inode=inode,
+                name=b"..",
+            )
+            db_cursor.execute(*dentry_object_dot_dot.insert())
+
+        return inode
+
+    def remove(self, parent_inode: InodeT, inode: InodeT) -> bool:
+        with self._db_cursor() as cur:
             cur.execute(
-                "DELETE FROM inodes WHERE id=? AND parent_inode=?",
+                "DELETE FROM dentrys WHERE inode=? AND parent_inode=?",
                 (inode, parent_inode),
             )
+
+            try:
+                st_link = self._get_file_stat_by_inode(inode).st_nlink
+            except FUSEError:
+                st_link = 0
+
+            if st_link == 0 and inode not in self._inode_map_fd:
+                cur.execute("DELETE FROM inodes WHERE id=?", (inode,))
+                return True
+        return False
 
     @fail_is_exit
     async def getattr(
@@ -650,14 +428,13 @@ class VirtFS(Operations):
     @fail_is_exit
     async def opendir(self, inode: InodeT, ctx: RequestContext) -> FileHandleT:  # noqa: ARG002
         fd = self._get_fd()
-        self._fd_map_inode[fd].add(inode)
+        self._fd_map_inode[fd] = inode
         return FileHandleT(fd)
 
     @fail_is_exit
     async def releasedir(self, fd: FileHandleT) -> None:
-        inodes = self._fd_map_inode.pop(fd)
-        for inode in inodes:
-            self.__fd_token_read.pop(inode, None)
+        inode = self._fd_map_inode.pop(fd)
+        self.__fd_token_read.pop(inode, None)
 
     @fail_is_exit
     async def statfs(self, ctx: RequestContext) -> StatvfsData:  # noqa: ARG002
@@ -667,14 +444,14 @@ class VirtFS(Operations):
         stat.f_frsize = 512
 
         max_size = 2**40
-        size = self._get_row("SELECT SUM(size) FROM tracks") or 0
+        size = self._get_int_row("SELECT SUM(size) FROM inodes")
 
         stat.f_blocks = max_size // stat.f_bsize
         stat.f_bfree = (max_size - size) // stat.f_frsize
         stat.f_bavail = stat.f_bfree
 
         max_inodes = 2**32
-        inodes = self._get_row("SELECT COUNT(id) FROM inodes") or 0
+        inodes = self._get_int_row("SELECT COUNT(id) FROM inodes")
 
         stat.f_files = max_inodes
         stat.f_ffree = max_inodes - inodes
@@ -686,67 +463,46 @@ class VirtFS(Operations):
     async def readdir(
         self, fd: int, start_id: int, token: ReaddirToken
     ) -> None:
-        (dir_inode,) = self._fd_map_inode[fd]
+        dir_inode = self._fd_map_inode[fd]
 
         if dir_inode in self.__fd_token_read:
             dir_list = self.__fd_token_read[dir_inode]
         else:
             result = []
             names = set()
-            with self.__db_cursor() as cur:
+            with self._db_cursor() as cur:
                 cur.execute(
                     """
                 SELECT
-                    inodes.id AS ID,
-                    tracks.name AS NAME
-                FROM inodes
-                INNER JOIN tracks ON tracks.id = inodes.reference_id
-                WHERE inodes.parent_inode = ?
-                    AND inodes.type = 'TRACK';
+                    *
+                FROM dentrys
+                WHERE parent_inode = ?
                 """,
                     (dir_inode,),
                 )
+                for row in cur.fetchall():
+                    name = row["name"]
+                    if name in names:
+                        continue
+                    if isinstance(name, str):
+                        name = name.encode()
 
-                for row in cur.fetchall():
-                    name = row["NAME"]
-                    if name in names:
-                        continue
                     names.add(name)
-                    result.append((name, row["id"]))
-                cur.execute(
-                    """
-                SELECT
-                    inodes.id AS ID,
-                    playlists.name AS NAME
-                FROM inodes
-                INNER JOIN playlists ON playlists.id = inodes.reference_id
-                WHERE inodes.parent_inode = ?
-                    AND inodes.type = 'PLAYLIST';
-                """,
-                    (dir_inode,),
-                )
-                for row in cur.fetchall():
-                    name = row["NAME"]
-                    if name in names:
-                        continue
-                    names.add(name)
-                    result.append((name, row["id"]))
+                    result.append((name, row["inode"]))
 
             self.__fd_token_read[dir_inode] = dir_list = [
-                (".", InodeT(1)),
-                ("..", InodeT(1)),
+                (b".", InodeT(1)),
                 *result,
             ]
 
         i = start_id + 1 or 0
 
-        dir_list_slice = dir_list[i:]
+        dir_list_slice = dir_list[i - 1 :]
         dir_list_slice.reverse()
         while len(dir_list_slice) > 0:
             name, inode = dir_list_slice.pop()
-            attr = await self.getattr(inode, RequestContext())
+            attr = self._get_file_stat_by_inode(inode)
 
-            name = name.replace("/", "-").encode()
             if not readdir_reply(
                 token,
                 name,
@@ -765,13 +521,16 @@ class VirtFS(Operations):
         ctx: RequestContext,  # noqa: ARG002
     ) -> FileInfo:
         fd = self._get_fd()
-        self._fd_map_inode[fd].add(inode)
+        self._fd_map_inode[fd] = inode
 
         return FileInfo(fh=FileHandleT(fd))
 
     @fail_is_exit
     async def release(self, fd: int) -> None:
-        self._fd_map_inode.pop(fd)
+        inode = self._fd_map_inode.pop(fd)
+        if self._get_file_stat_by_inode(inode).st_nlink == 0:
+            with self._db_cursor() as cur:
+                cur.execute("DELETE FROM inodes WHERE id=?", (inode,))
 
     @fail_is_exit
     async def unlink(
@@ -809,6 +568,45 @@ class VirtFS(Operations):
         ctx: RequestContext,  # noqa: ARG002
     ) -> bool:
         return True
+
+    @fail_is_exit
+    async def symlink(
+        self,
+        parent_inode: InodeT,
+        name: bytes,
+        target: bytes,
+        ctx: RequestContext,
+    ) -> EntryAttributes:
+        target_dentry = Dentry.from_row(
+            self._get_dict_row(
+                "SELECT * FROM dentrys WHERE name=?",
+                (target,),
+            )
+        )
+        if target_dentry is None:
+            raise FUSEError(errno.ENOENT)
+
+        with self._db_cursor() as cur:
+            inode = self._create(
+                parent_inode=parent_inode,
+                name=name,
+                size=4096,
+                mode=(stat.S_IFLNK | 0o777),
+                target=target,
+                db_cursor=cur,
+            )
+        return await self.getattr(inode, ctx)
+
+    @fail_is_exit
+    async def readlink(self, inode: InodeT, ctx: RequestContext) -> FileNameT:  # noqa: ARG002
+        row = Inode.from_row(
+            self._get_dict_row("SELECT * FROM inodes WHERE id=?", (inode,))
+        )
+        if row is None:
+            raise FUSEError(errno.EINVAL)
+        if not stat.S_ISLNK(row.mode):
+            raise FUSEError(errno.EINVAL)
+        return FileNameT(row.target)
 
     def xattrs(self, inode: InodeT) -> dict[str, Any]:
         return {

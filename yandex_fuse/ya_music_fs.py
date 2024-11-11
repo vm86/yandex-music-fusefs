@@ -3,10 +3,13 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import stat
+import time
 from asyncio import (
     FIRST_COMPLETED,
     CancelledError,
     Event,
+    InvalidStateError,
     Task,
     create_task,
     sleep,
@@ -16,7 +19,7 @@ from asyncio import (
 from asyncio import (
     TimeoutError as AsyncTimeoutError,
 )
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -26,6 +29,7 @@ from aiohttp import (
     ClientError,
     ClientSession,
     ClientTimeout,
+    ConnectionTimeoutError,
     SocketTimeoutError,
 )
 from pyfuse3 import (
@@ -35,6 +39,7 @@ from pyfuse3 import (
     FUSEError,
     InodeT,
     RequestContext,
+    XAttrNameT,
 )
 from yandex_music.exceptions import (  # type: ignore[import-untyped]
     BadRequestError,
@@ -44,24 +49,23 @@ from yandex_music.exceptions import (  # type: ignore[import-untyped]
     UnauthorizedError,
 )
 
-from yandex_fuse.virt_fs import VirtFS, fail_is_exit
+from yandex_fuse.virt_fs import SQLRow, VirtFS, fail_is_exit
 from yandex_fuse.ya_player import ExtendTrack, TrackTag, YandexMusicPlayer
 
 if TYPE_CHECKING:
     from collections.abc import (
         Callable,
         Coroutine,
+        Iterator,
     )
+    from sqlite3 import Cursor
 
 log = logging.getLogger(__name__)
 
-LIMIT_TASKS = 5
-LIMIT_ONYOURWAVE = 200
+LIMIT_TASKS = 10
+LIMIT_ONYOURWAVE = 50
 
-PLAYLIST_ID2NAME = {
-    "user:onyourwave": "Моя волна",
-    "likes": "Мне нравится",
-}
+PLAYLIST_ID2NAME = {"likes": "Мне нравится", "user:onyourwave": "Моя волна"}
 
 
 P = ParamSpec("P")
@@ -73,7 +77,6 @@ def retry_request(
 ) -> Callable[..., Coroutine[Any, Any, T | None]]:
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T | None:
         for retry in range(1, count + 1):
-            log.debug("Retry %d/%d", retry, count)
             try:
                 return await func(*args, **kwargs)
             except (BadRequestError, NotFoundError):
@@ -86,9 +89,9 @@ def retry_request(
                 SocketTimeoutError,
             ) as err:
                 log.error("Error request: %r %r/%r", err, args[1:], kwargs)  # noqa:TRY400
-                await sleep(0.5)
-
-        return None
+                await sleep(0.75 * retry)
+            log.debug("Retry %d/%d - %r", retry + 1, count, func)
+        raise RuntimeError("Retry limit exceeded.")
 
     return wrapper
 
@@ -100,7 +103,8 @@ class Buffer:
         self,
         direct_link: str,
         client_session: ClientSession,
-        track: dict[str, Any],
+        track: SQLTrack,
+        fuse_music: YaMusicFS,
     ) -> None:
         self.__direct_link = direct_link
         self.__client_session = client_session
@@ -108,7 +112,8 @@ class Buffer:
         self.__data = bytearray()
         self.__track = track
         self.__total_read = 0
-        self.__tag = TrackTag.from_json(track)
+        self.__tag = TrackTag.from_json(track.__dict__)
+        self.__fuse_music = fuse_music
         self.__download_task: Task[Any] | None = create_task(
             self.download(), name="download"
         )
@@ -139,16 +144,35 @@ class Buffer:
             while (offset + size - self.offset) > 0:
                 if self.is_downloded:
                     break
+                with suppress(InvalidStateError):
+                    if self.__download_task is not None:
+                        self.__download_task.result()
+
                 self.__ready_read.clear()
                 with suppress(AsyncTimeoutError):
-                    await wait_for(self.__ready_read.wait(), timeout=15)
+                    await wait_for(self.__ready_read.wait(), timeout=5)
         self.__total_read += size
         return bytes(self.__bytes.getbuffer()[offset : offset + size])
 
     def total_second(self) -> int:
-        s2p = self.__tag.duration_ms / self.__track["size"]
+        s2p = self.__tag.duration_ms / self.__track.size
         second_read = s2p * self.__total_read
         return int(min(second_read // 1000, self.__tag.duration_ms // 1000))
+
+    def _write_tag(self, new_buffer: bytes, real_size: int) -> None:
+        self.__bytes.seek(0)
+        self.write(new_buffer)
+        self.__tagging = True
+
+        if real_size + self.__tag.size != self.__track.size:
+            log.warning(
+                "Missmath tagging. "
+                "Track size: %d, tag size: %d "
+                "Content-Length: %d",
+                self.__track.size,
+                self.__tag.size,
+                real_size,
+            )
 
     @retry_request
     async def download(self) -> None:
@@ -161,37 +185,132 @@ class Buffer:
             ) as resp:
                 resp.raise_for_status()
                 async for chunk in resp.content.iter_chunked(self.CHUNK_SIZE):
-                    if not self.__tagging:
-                        buffer.write(chunk)
-                        new_buffer = self.__tag.to_bytes(buffer)
-                        if new_buffer is None:
-                            continue
-                        self.__bytes.seek(0)
-                        self.write(new_buffer)
-                        self.__tagging = True
-                    else:
+                    if self.__tagging:
                         self.write(chunk)
+                        continue
+
+                    buffer.write(chunk)
+                    new_buffer = self.__tag.to_bytes(buffer)
+                    if new_buffer is None:
+                        continue
+                    self._write_tag(
+                        new_buffer, int(resp.headers["Content-Length"])
+                    )
+
         except CancelledError:
+            raise
+        except ConnectionTimeoutError:
+            direct_link = await self.__fuse_music.get_or_update_direct_link(
+                self.__track.track_id,
+                self.__track.codec,
+                self.__track.bitrate,
+            )
+            if direct_link is None:
+                raise RuntimeError("Error get direct link.") from None
+            self.__direct_link = direct_link
             raise
         except Exception:
             log.exception("Error downloading ..")
             raise
         else:
-            log.debug("Track %s downloaded", self.__track["name"])
-            if self.__download_task is not None:
-                download_task = self.__download_task
-                self.__download_task = None
-                download_task.cancel()
+            log.debug("Track %s downloaded", self.__track.name)
+            if self.__download_task is None:
+                return
+            download_task = self.__download_task
+            self.__download_task = None
+            download_task.cancel()
+
+
+@dataclass
+class SQLTrack(SQLRow):
+    __tablename__ = "tracks"
+
+    name: bytes
+    track_id: str
+    playlist_id: str
+    codec: str
+    bitrate: int
+    size: int
+    artist: str
+    title: str
+    album: str
+    year: str
+    genre: str
+    duration_ms: int
+
+    inode: InodeT
+    id: int | None = None
+
+
+@dataclass
+class SQLPlaylist(SQLRow):
+    __tablename__ = "playlists"
+
+    name: str
+    playlist_id: str
+    inode: InodeT
+    revision: int = 0
+    batch_id: str = ""
+    station_id: str = ""
+    id: int | None = None
 
 
 @dataclass
 class StreamReader:
     buffer: Buffer
-    track: dict[str, Any]
+    track: SQLTrack
     is_send_feedback: bool = False
 
 
 class YaMusicFS(VirtFS):
+    FILE_DB = str(Path.home().joinpath(".cache/yandex-fuse2.db"))
+
+    CREATE_TABLE_QUERYS = (
+        *VirtFS.CREATE_TABLE_QUERYS,
+        """
+        CREATE TABLE IF NOT EXISTS playlists (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            inode        INT NOT NULL
+                REFERENCES inodes(id) ON DELETE CASCADE,
+            playlist_id  TEXT(255) NOT NULL UNIQUE,
+            station_id   TEXT(255),
+            batch_id     TEXT(255),
+            revision     INT DEFAULT 0,
+            name         TEXT(255) NOT NULL,
+            UNIQUE       (name, playlist_id, inode)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS tracks (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            inode        INT NOT NULL
+                REFERENCES inodes(id) ON DELETE CASCADE,
+            name         BLOB(256) NOT NULL,
+            track_id     TEXT(255) NOT NULL UNIQUE,
+            playlist_id  TEXT(255) NOT NULL
+                REFERENCES playlists(playlist_id) ON DELETE RESTRICT,
+            codec        BLOB(8) NOT NULL,
+            bitrate      INT NOT NULL,
+            size         INT NOT NULL,
+            artist       TEXT(255),
+            title        TEXT(255),
+            album        TEXT(255),
+            year         TEXT(255),
+            genre        TEXT(255),
+            duration_ms  INT,
+            UNIQUE       (name, track_id, inode)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS direct_link (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id   TEXT(255) NOT NULL UNIQUE,
+            link       BLOB(256) NOT NULL,
+            expired    INT NOT NULL
+        )
+        """,
+    )
+
     CHUNK_SIZE = 128
 
     def __init__(self, *args: P.args, **kwargs: P.kwargs) -> None:
@@ -222,11 +341,39 @@ class YaMusicFS(VirtFS):
     @property
     def _ya_player(self) -> YandexMusicPlayer:
         if self.__ya_player is None:
-            raise RuntimeError("ClientSession is not init!")
+            raise RuntimeError(
+                "YandexMusicPlayer is not init! %r", self.__ya_player
+            )
         return self.__ya_player
 
+    @contextmanager
+    def _get_direct_link(
+        self, track_id: str
+    ) -> Iterator[tuple[str | None, Cursor]]:
+        with self._db_cursor() as cur:
+            cur.execute(
+                "SELECT * FROM direct_link WHERE track_id=?",
+                (track_id,),
+            )
+            row = cur.fetchone()
+
+            if row is None:
+                yield (None, cur)
+                return
+            expired = int(time.time() * 1e9)
+            if row["expired"] > expired:
+                log.debug(
+                    "Track %s, lifetime %r",
+                    track_id,
+                    (row["expired"] - expired) / 1e9,
+                )
+                yield (row["link"], cur)
+                return
+            log.debug("Direct link %s direct link has expired", track_id)
+            yield (None, cur)
+
     @retry_request
-    async def _get_or_update_direct_link(
+    async def get_or_update_direct_link(
         self,
         track_id: str,
         codec: str,
@@ -234,12 +381,15 @@ class YaMusicFS(VirtFS):
     ) -> str | None:
         with self._get_direct_link(track_id) as (direct_link, cursor):
             if direct_link is not None:
-                async with self._client_session.request(
-                    "HEAD",
-                    direct_link,
-                ) as resp:
-                    if resp.ok:
-                        return direct_link
+                try:
+                    async with self._client_session.request(
+                        "HEAD",
+                        direct_link,
+                    ) as resp:
+                        if resp.ok:
+                            return direct_link
+                except ClientError as err:
+                    log.error("Fail get direct link: %r", err)  # noqa: TRY400
 
             new_direct_link = await self._ya_player.get_download_link(
                 track_id,
@@ -247,40 +397,162 @@ class YaMusicFS(VirtFS):
                 bitrate_in_kbps,
             )
             if new_direct_link is None:
-                log.warning("Track %s is not be downloaded!", track_id)
                 return None
-            self._insert_direct_link(cursor, track_id, new_direct_link)
+
+            expired = int((time.time() + 8600) * 1e9)
+            cursor.execute(
+                """
+                INSERT INTO direct_link
+                (track_id, link, expired)
+                VALUES(?, ?, ?)
+                ON CONFLICT(track_id)
+                DO UPDATE SET link=excluded.link,expired=excluded.expired
+                """,
+                (track_id, new_direct_link, expired),
+            )
+            log.debug("Direct link: %s, track: %s", new_direct_link, track_id)
             return new_direct_link
 
-    @retry_request
-    async def _update_track(self, track: ExtendTrack, dir_inode: int) -> None:
-        if not track.available:
-            log.warning(
-                "Track %s is not available for listening.",
-                track.save_name,
+    def _get_playlist_by_id(self, playlist_id: str) -> SQLPlaylist | None:
+        return SQLPlaylist.from_row(
+            self._get_dict_row(
+                """
+            SELECT
+                *
+            FROM playlists
+            WHERE
+                playlists.playlist_id = ?
+            """,
+                (playlist_id,),
             )
-            return
-
-        for exists_track in self._get_links_track_by_id(track.id):
-            if exists_track["parent_inode"] == dir_inode:
-                return
-            log.debug(
-                "Link track %s / %s - %s",
-                track.id,
-                track.save_name,
-                track.real_id,
-            )
-            self._link_track_inode(exists_track["id"], dir_inode)
-            return
-
-        log.debug(
-            "Create track %s / %s - %s",
-            track.id,
-            track.save_name,
-            track.real_id,
         )
+
+    def _create_plyalist(self, playlist: SQLPlaylist) -> SQLPlaylist:
+        with self._db_cursor() as cur:
+            inode = self._create(
+                parent_inode=self.ROOT_INODE,
+                name=playlist.name.encode(),
+                size=0,
+                mode=(stat.S_IFDIR | 0o755),
+                target=b"",
+                db_cursor=cur,
+            )
+            playlist.inode = inode
+
+            cur.execute(*playlist.insert())
+
+        return playlist
+
+    def _update_plyalist(
+        self,
+        uid: str,
+        revision: int,
+        batch_id: str | None = None,
+    ) -> None:
+        with self._db_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE playlists SET revision=?,batch_id=? WHERE playlist_id=?;
+            """,
+                (
+                    revision,
+                    batch_id,
+                    uid,
+                ),
+            )
+
+    def _get_track_by_id(self, track_id: str) -> SQLTrack | None:
+        result = self._get_dict_row(
+            """
+            SELECT
+                *
+            FROM tracks
+            WHERE track_id=?
+            """,
+            (track_id,),
+        )
+        if result is None:
+            return None
+        return SQLTrack(**result)
+
+    def _get_track_by_inode(self, inode: int) -> SQLTrack | None:
+        return SQLTrack.from_row(
+            self._get_dict_row(
+                """
+            SELECT
+                *
+            FROM tracks
+            WHERE inode=?
+            """,
+                (inode,),
+            )
+        )
+
+    def _create_track(self, track: SQLTrack, parent_inode: int) -> None:
+        with self._db_cursor() as cur:
+            inode = self._create(
+                parent_inode=InodeT(parent_inode),
+                name=track.name,
+                size=track.size,
+                mode=(stat.S_IFREG | 0o644),
+                target=b"",
+                db_cursor=cur,
+            )
+            log.debug(
+                "Create track %s, inode: %d, parent inode: %d",
+                track.name,
+                inode,
+                parent_inode,
+            )
+            track.inode = inode
+            cur.execute(*track.insert())
+
+    @retry_request
+    async def _update_track(
+        self,
+        track: ExtendTrack,
+        playlist_id: str,
+        dir_inode: InodeT,
+    ) -> None:
         if (
-            direct_link := await self._get_or_update_direct_link(
+            exist_track := self._get_track_by_id(track.track_id)
+        ) is not None and exist_track.playlist_id != playlist_id:
+            playlist_info = self._get_playlist_by_id(exist_track.playlist_id)
+            if playlist_info is None:
+                raise RuntimeError("Error get playlist info")
+
+            target = str(
+                Path("..")
+                .joinpath(playlist_info.name)
+                .joinpath(exist_track.name.decode())
+            ).encode()
+
+            track_link = self._get_inode_by_name(
+                InodeT(dir_inode), track.save_name.encode()
+            )
+            if track_link is not None:
+                return
+
+            with self._db_cursor() as cur:
+                inode = self._create(
+                    parent_inode=dir_inode,
+                    name=track.save_name.encode(),
+                    size=4096,
+                    mode=(stat.S_IFLNK | 0o777),
+                    target=target,
+                    db_cursor=cur,
+                )
+            log.debug(
+                "Symlink track %s -> %d / %s - %d",
+                track.track_id,
+                inode,
+                track.save_name,
+                dir_inode,
+            )
+            return
+
+        if (
+            direct_link := await self.get_or_update_direct_link(
                 track.track_id,
                 track.codec,
                 track.bitrate_in_kbps,
@@ -297,49 +569,108 @@ class YaMusicFS(VirtFS):
             byte = BytesIO()
             async for chunk in resp.content.iter_chunked(1024):
                 byte.write(chunk)
-                old_size = len(byte.getbuffer())
                 new_buffer = track.tag.to_bytes(byte)
                 if new_buffer is None:
                     continue
-                tag_size = len(new_buffer) - old_size
-                track.size += tag_size
-
+                track.size += track.tag.size
                 break
 
         if track.save_name.endswith("unknown"):
             log.warning("Track %s create skip.", track.save_name)
             return
 
+        if (
+            inode_by_name := self._get_inode_by_name(
+                dir_inode, track.save_name.encode()
+            )
+        ) is not None:
+            exist_track = self._get_track_by_inode(inode_by_name)
+            if exist_track is None:
+                raise RuntimeError(
+                    f"""
+                    Missing track {track.save_name} / {track.track_id}
+                    by inode {inode_by_name}"""
+                )
+            log.debug(
+                "Update track %s, track id %s -> %s, inode: %d",
+                track.save_name,
+                exist_track.track_id,
+                track.track_id,
+                inode_by_name,
+            )
+            with self._db_cursor() as cur:
+                cur.execute(
+                    """
+                UPDATE tracks SET track_id=?,size=? WHERE id=?;
+                """,
+                    (track.track_id, track.size, exist_track.id),
+                )
+                cur.execute(
+                    """
+                UPDATE inodes SET size=? WHERE id=?;
+                """,
+                    (track.size, exist_track.inode),
+                )
+            return
+
+        log.debug(
+            "Create track %s / %s - %d",
+            track.track_id,
+            track.save_name,
+            dir_inode,
+        )
+
         tag = track.tag.to_dict()
         self._create_track(
-            (
-                track.save_name,
-                track.id,
-                track.codec,
-                track.bitrate_in_kbps,
-                track.size,
-                tag["artist"],
-                tag["title"],
-                tag["album"],
-                tag["year"],
-                tag["genre"],
-                tag["duration_ms"],
+            SQLTrack(
+                name=track.save_name.encode(),
+                track_id=track.track_id,
+                playlist_id=playlist_id,
+                codec=track.codec,
+                bitrate=track.bitrate_in_kbps,
+                size=track.size,
+                artist=tag["artist"],
+                title=tag["title"],
+                album=tag["album"],
+                year=tag["year"],
+                genre=tag["genre"],
+                duration_ms=tag["duration_ms"],
+                inode=InodeT(-1),
             ),
             dir_inode,
         )
 
-    def _unlink_track(self, track_id: str, dir_inode: int) -> None:
-        for exists_track in self._get_links_track_by_id(track_id):
-            if exists_track["parent_inode"] != dir_inode:
-                return
-            log.debug(
-                "Unlink track %s, inode: %d, dir_inode: %d",
-                track_id,
-                exists_track["inode"],
-                dir_inode,
+    def _unlink_track(self, track_id: str, dir_inode: InodeT) -> None:
+        track = self._get_track_by_id(track_id)
+        if track is None:
+            return
+        with self._db_cursor() as cur:
+            if self.remove(dir_inode, track.inode):
+                cur.execute(
+                    "DELETE FROM tracks WHERE inode=? AND track_id=?",
+                    (track.inode, track.track_id),
+                )
+        self._invalidate_inode(track.inode)
+
+    def _get_tracks(
+        self, playlist_id: str | None = None
+    ) -> dict[str, SQLTrack]:
+        result = {}
+        with self._db_cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    *
+                FROM tracks
+                ORDER BY track_id
+                """,
             )
-            self.remove(dir_inode, exists_track["inode"])
-            self._invalidate_inode(exists_track["inode"])
+
+            for row in cur.fetchall():
+                if playlist_id and row["playlist_id"] != playlist_id:
+                    continue
+                result[row["track_id"]] = SQLTrack(**row)
+        return result
 
     @staticmethod
     async def _background_tasks(
@@ -356,16 +687,22 @@ class YaMusicFS(VirtFS):
 
     async def __update_like_playlists(self) -> None:
         playlist_id = "likes"
-        playlist_info = self._get_playlist_by_id(playlist_id)
-        if playlist_info is None:
-            self._create_plyalist(PLAYLIST_ID2NAME[playlist_id], playlist_id)
-            playlist_info = self._get_playlist_by_id(playlist_id)
 
-        if playlist_info is None:
-            raise RuntimeError("Playlist info is empty!")
+        playlist_info = self._get_playlist_by_id(
+            playlist_id
+        ) or self._create_plyalist(
+            SQLPlaylist(
+                name=PLAYLIST_ID2NAME[playlist_id],
+                playlist_id=playlist_id,
+                station_id="",
+                batch_id="",
+                revision=0,
+                inode=InodeT(-1),
+            ),
+        )
 
-        dir_inode = playlist_info["inode_id"]
-        revision = playlist_info["revision"] or 0
+        dir_inode = playlist_info.inode
+        revision = playlist_info.revision
 
         # BUG: if if_modified_since_revision > 0
         #   Traceback: AttributeError: 'str' object has no attribute 'get'
@@ -382,17 +719,21 @@ class YaMusicFS(VirtFS):
 
         log.info("Totol like track: %d", len(users_likes_tracks.tracks))
 
-        like_tracks_ids = {track.id for track in users_likes_tracks.tracks}
-        loaded_tracks = self._get_tracks()
+        like_tracks_ids = {
+            track.track_id for track in users_likes_tracks.tracks
+        }
+        loaded_tracks = self._get_tracks(playlist_id)
         tracks = await users_likes_tracks.fetch_tracks()
 
         new_tracks_ids = like_tracks_ids - loaded_tracks.keys()
         unlink_tracks_ids = loaded_tracks.keys() - like_tracks_ids
 
         log.debug(
-            "New track like playlist: %d. Remove track: %d",
+            "New track like playlist: %d. Remove track: %d, revision: %d/%d",
             len(new_tracks_ids),
             len(unlink_tracks_ids),
+            revision,
+            users_likes_tracks.revision,
         )
 
         tracks = (
@@ -404,13 +745,16 @@ class YaMusicFS(VirtFS):
         tasks = set()
         error_update = False
 
+        for track_id in unlink_tracks_ids:
+            self._unlink_track(track_id, dir_inode)
+
         async for track in self._ya_player.load_tracks(
             tracks,
             exclude_track_ids=set(loaded_tracks.keys()),
         ):
             tasks.add(
                 create_task(
-                    self._update_track(track, dir_inode),
+                    self._update_track(track, playlist_id, dir_inode),
                     name=f"create-track-{track.save_name}",
                 ),
             )
@@ -420,9 +764,6 @@ class YaMusicFS(VirtFS):
         while tasks:
             tasks, error = await self._background_tasks(tasks)
             error_update = error or error_update
-
-        for track_id in unlink_tracks_ids:
-            self._unlink_track(track_id, dir_inode)
 
         if not error_update:
             self._update_plyalist(playlist_id, users_likes_tracks.revision)
@@ -435,28 +776,41 @@ class YaMusicFS(VirtFS):
             users_likes_tracks.revision,
         )
 
-    async def __update_onyourwave_tracks(self) -> None:
-        playlist_id = "user:onyourwave"
-        playlist_info = self._get_playlist_by_id(playlist_id)
-        if playlist_info is None:
-            self._create_plyalist(PLAYLIST_ID2NAME[playlist_id], playlist_id)
-            playlist_info = self._get_playlist_by_id(playlist_id)
+    async def __update_station_tracks(
+        self, playlist_id: str, playlist_name: str
+    ) -> None:
+        playlist_info = self._get_playlist_by_id(
+            playlist_id
+        ) or self._create_plyalist(
+            SQLPlaylist(
+                name=playlist_name,
+                playlist_id=playlist_id,
+                station_id=playlist_id,
+                batch_id="",
+                revision=0,
+                inode=InodeT(-1),
+            )
+        )
 
         if playlist_info is None:
             raise RuntimeError("Playlist info is empty!")
 
-        dir_inode = playlist_info["inode_id"]
-
-        if len(self._get_tracks_by_parent_inode(dir_inode)) >= LIMIT_ONYOURWAVE:
+        dir_inode = playlist_info.inode
+        loaded_tracks = self._get_tracks(playlist_id)
+        if len(loaded_tracks) > LIMIT_ONYOURWAVE:
             log.debug("Music directory is full.")
             return
 
         tasks = set()
         error_update = False
-        async for track in self._ya_player.next_tracks("user:onyourwave"):
+        async for track in self._ya_player.next_tracks(
+            playlist_id,
+            count=LIMIT_ONYOURWAVE,
+            exclude_track_ids=set(loaded_tracks.keys()),
+        ):
             tasks.add(
                 create_task(
-                    self._update_track(track, dir_inode),
+                    self._update_track(track, playlist_id, dir_inode),
                     name=f"create-track-{track.save_name}",
                 ),
             )
@@ -476,20 +830,85 @@ class YaMusicFS(VirtFS):
 
     async def __cleanup_track(self) -> None:
         loaded_tracks = self._get_tracks()
+
+        if not loaded_tracks:
+            return
+
+        loaded_tracks_by_id = {}
+        for track_id, track in loaded_tracks.items():
+            track_id_without_album_id, *unused = track_id.split(":", 1)
+            loaded_tracks_by_id[track_id_without_album_id] = track
+
         ya_tracks = await self._ya_player.tracks(track_ids=loaded_tracks.keys())
         for ya_track in ya_tracks:
             if ya_track.available:
                 continue
-            track = loaded_tracks[ya_track.track_id]
-            for info_track in self._get_links_track_by_id(ya_track.track_id):
-                log.warning(
-                    "Track %s is not available for listening. Cleanup inode %d",
-                    track["name"],
-                    info_track["inode"],
-                )
-                self.remove(info_track["parent_inode"], info_track["inode"])
-                self._invalidate_inode(info_track["inode"])
-        log.debug("Cleanup finished.")
+
+            try:
+                info_track = loaded_tracks[ya_track.track_id]
+            except KeyError:
+                info_track = loaded_tracks_by_id[ya_track.id]
+
+            log.warning(
+                "Track %s is not available for listening. Cleanup inode %d",
+                ya_track.title,
+                info_track.inode,
+            )
+            playlist_info = self._get_playlist_by_id(info_track.playlist_id)
+            if playlist_info is None:
+                raise RuntimeError("Playlist doesn't exist")
+            self._unlink_track(info_track.track_id, playlist_info.inode)
+
+        with self._db_cursor() as cur:
+            cur.execute(
+                """
+            DELETE FROM inodes
+            WHERE inodes.id IN (
+                SELECT a.id
+                FROM (
+                    SELECT
+                        inodes.id,
+                        dentrys.inode
+                    FROM inodes
+                    LEFT JOIN dentrys ON dentrys.inode = inodes.id
+                ) a
+                INNER JOIN
+                    (
+                        SELECT
+                            inodes.id,
+                            dentrys.inode
+                        FROM inodes
+                        LEFT JOIN dentrys ON dentrys.parent_inode = inodes.id
+                    ) b
+                    ON a.id = b.id
+                WHERE a.inode IS NULL AND b.inode IS NULL
+            )
+            """
+            )
+            cur.execute(
+                """
+            DELETE FROM tracks
+            WHERE
+                tracks.inode IN (
+                    SELECT tracks.inode
+                    FROM tracks
+                    LEFT JOIN inodes ON tracks.inode = inodes.id
+                    WHERE inodes.id IS NULL
+                );
+            """
+            )
+            cur.execute("""
+            DELETE FROM direct_link
+            WHERE
+                id IN (
+                    SELECT direct_link.id
+                    FROM direct_link
+                    LEFT JOIN tracks
+                        ON direct_link.track_id = tracks.track_id
+                    WHERE tracks.track_id IS NULL
+                );
+            """)
+        log.debug("Cleanup finished %d/%d", len(ya_tracks), len(loaded_tracks))
 
     async def __fsm(self) -> None:
         while True:
@@ -497,9 +916,27 @@ class YaMusicFS(VirtFS):
                 if not self._ya_player.is_init:
                     await sleep(5)
                     continue
-                await self.__update_like_playlists()
-                await self.__update_onyourwave_tracks()
+
                 await self.__cleanup_track()
+                await self.__update_like_playlists()
+
+                playlist_onyourwave_id = "user:onyourwave"
+                await self.__update_station_tracks(
+                    playlist_onyourwave_id,
+                    PLAYLIST_ID2NAME[playlist_onyourwave_id],
+                )
+                # playlists = await self._ya_player.users_playlists_list()
+                # for playlist in playlists:
+                #    print(playlist.kind, playlist.title)
+
+                # stations = await self._ya_player.rotor_stations_list()
+
+                # for station in stations:
+                #    _station = station.station
+                #    plyalist_id = f"{_station.id.type}:{_station.id.tag}"
+                #    plyalist_name = _station.name
+                #    print(plyalist_id, plyalist_name)
+                # await self.__update_station_tracks()
 
                 await sleep(300)
             except CancelledError:
@@ -508,17 +945,17 @@ class YaMusicFS(VirtFS):
                 log.exception("Error sync:")
                 await sleep(60)
 
-    async def _get_buffer(self, track: dict[str, Any]) -> Buffer | None:
+    async def _get_buffer(self, track: SQLTrack) -> Buffer | None:
         if (
-            direct_link := await self._get_or_update_direct_link(
-                track["track_id"],
-                track["codec"],
-                track["bitrate"],
+            direct_link := await self.get_or_update_direct_link(
+                track.track_id,
+                track.codec,
+                track.bitrate,
             )
         ) is None:
-            log.warning("Track %s is not be downloaded!", track["name"])
+            log.warning("Track %s is not be downloaded!", track.name)
             return None
-        return Buffer(direct_link, self._client_session, track)
+        return Buffer(direct_link, self._client_session, track, self)
 
     @fail_is_exit
     async def open(
@@ -543,7 +980,7 @@ class YaMusicFS(VirtFS):
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise FUSEError(errno.EPERM)
 
-        log.debug("Open stream %s -> %d", track["name"], file_info.fh)
+        log.debug("Open stream %s -> %d", track.name, file_info.fh)
         self._fd_map_stream[file_info.fh] = StreamReader(
             track=track,
             buffer=buffer,
@@ -555,7 +992,10 @@ class YaMusicFS(VirtFS):
     async def read(self, fd: FileHandleT, offset: int, size: int) -> bytes:
         stream_reader = self._fd_map_stream[fd]
 
-        chunk = await stream_reader.buffer.read_from(offset, size)
+        try:
+            chunk = await stream_reader.buffer.read_from(offset, size)
+        except RuntimeError:
+            raise FUSEError(errno.EPIPE) from None
 
         if len(chunk) > size:
             log.warning(
@@ -571,15 +1011,16 @@ class YaMusicFS(VirtFS):
                 and stream_reader.buffer.is_downloded
                 and stream_reader.buffer.total_second() > 30  # noqa: PLR2004
             ):
-                playlist = self._get_playlist_by_inode(
-                    stream_reader.track["parent_inode"],
+                playlist = self._get_playlist_by_id(
+                    stream_reader.track.playlist_id
                 )
 
-                if playlist is not None and playlist["batch_id"] is not None:
+                if playlist is not None and playlist.batch_id is not None:
                     await self._ya_player.feedback_track(
-                        stream_reader.track["track_id"],
+                        stream_reader.track.track_id,
                         "trackStarted",
-                        playlist["batch_id"],
+                        playlist.station_id,
+                        playlist.batch_id,
                         0,
                     )
                     stream_reader.is_send_feedback = True
@@ -598,48 +1039,74 @@ class YaMusicFS(VirtFS):
         if stream_reader is None:
             log.warning("FD %d is none.", fd)
             return
-        log.debug("Release stream %d > %s", fd, stream_reader.track["name"])
-        parent_inode = stream_reader.track["parent_inode"]
-        playlist = self._get_playlist_by_inode(parent_inode)
-
-        if playlist is None:
-            raise RuntimeError("Playlist info is empty!")
-
-        if playlist["batch_id"] is None:
-            return
-
-        total_second = 10
-        if stream_reader.buffer is not None:
-            total_second = stream_reader.buffer.total_second()
-        if total_second == 0:
-            return
+        log.debug("Release stream %d > %s", fd, stream_reader.track.name)
 
         try:
-            await self._ya_player.feedback_track(
-                stream_reader.track["track_id"],
-                "trackFinished",
-                playlist["batch_id"],
-                total_second,
-            )
+            if (
+                not stream_reader.is_send_feedback
+                and stream_reader.buffer.is_downloded
+            ):
+                playlist = self._get_playlist_by_id(
+                    stream_reader.track.playlist_id
+                )
+
+                if playlist is not None and playlist.batch_id is not None:
+                    await self._ya_player.feedback_track(
+                        stream_reader.track.track_id,
+                        "trackFinished",
+                        playlist.station_id,
+                        playlist.batch_id,
+                        stream_reader.buffer.total_second(),
+                    )
+                    stream_reader.is_send_feedback = True
         except CancelledError:
             raise
         except Exception:
             log.exception("Error send feedback:")
 
+    @fail_is_exit
+    async def setxattr(
+        self,
+        inode: InodeT,
+        name: XAttrNameT,
+        value: bytes,
+        ctx: RequestContext,  # noqa: ARG002
+    ) -> None:
+        track = self._get_track_by_inode(inode)
+        if track is None:
+            raise FUSEError(errno.ENOENT)
+
+        playlist_info = self._get_playlist_by_id(track.playlist_id)
+        if playlist_info is None:
+            raise FUSEError(errno.ENOENT)
+
+        if name == b".invalidate":
+            self._invalidate_inode(inode)
+
+        if name == b"update":
+            if value == b".recreate":
+                self._unlink_track(track.track_id, playlist_info.inode)
+
+            ya_tracks = await self._ya_player.tracks(track_ids=[track.track_id])
+            async for ya_track in self._ya_player.load_tracks(
+                ya_tracks, exclude_track_ids=set()
+            ):
+                await self._update_track(
+                    ya_track, track.playlist_id, playlist_info.inode
+                )
+
     def xattrs(self, inode: InodeT) -> dict[str, Any]:
-        track_info = self._get_track_by_inode(inode) or {}
         return {
             "inode": inode,
             "nlookup": len(self._nlookup),
-            "fd_map_inode": len(self._fd_map_inode),
+            "inode_map_fd": self._inode_map_fd,
             "queue_invalidate_inode": self.queue_later_invalidate_inode,
-            "track_info": track_info,
             "stream": {
                 fd: {
-                    "name": stream.track["name"],
-                    "size": stream.track["size"],
-                    "codec": stream.track["codec"],
-                    "bitrate": stream.track["bitrate"],
+                    "name": stream.track.name,
+                    "size": stream.track.size,
+                    "codec": stream.track.codec,
+                    "bitrate": stream.track.bitrate,
                     "play_second": stream.buffer.total_second()
                     if stream.buffer is not None
                     else 0,
