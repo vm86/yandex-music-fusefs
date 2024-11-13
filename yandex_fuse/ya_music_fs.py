@@ -149,8 +149,11 @@ class Buffer:
                         self.__download_task.result()
 
                 self.__ready_read.clear()
-                with suppress(AsyncTimeoutError):
+                try:
                     await wait_for(self.__ready_read.wait(), timeout=5)
+                except AsyncTimeoutError:
+                    log.warning("Slow downloading %s", self.__track.name)
+
         self.__total_read += size
         return bytes(self.__bytes.getbuffer()[offset : offset + size])
 
@@ -190,7 +193,7 @@ class Buffer:
                         continue
 
                     buffer.write(chunk)
-                    new_buffer = self.__tag.to_bytes(buffer)
+                    new_buffer = self.__tag.to_bytes(buffer, self.__track.codec)
                     if new_buffer is None:
                         continue
                     self._write_tag(
@@ -214,6 +217,7 @@ class Buffer:
             raise
         else:
             log.debug("Track %s downloaded", self.__track.name)
+            self.__ready_read.set()
             if self.__download_task is None:
                 return
             download_task = self.__download_task
@@ -230,6 +234,7 @@ class SQLTrack(SQLRow):
     playlist_id: str
     codec: str
     bitrate: int
+    quality: str
     size: int
     artist: str
     title: str
@@ -291,6 +296,7 @@ class YaMusicFS(VirtFS):
                 REFERENCES playlists(playlist_id) ON DELETE RESTRICT,
             codec        BLOB(8) NOT NULL,
             bitrate      INT NOT NULL,
+            quality      TEXT(20) NOT NULL,
             size         INT NOT NULL,
             artist       TEXT(255),
             title        TEXT(255),
@@ -391,27 +397,44 @@ class YaMusicFS(VirtFS):
                 except ClientError as err:
                     log.error("Fail get direct link: %r", err)  # noqa: TRY400
 
-            new_direct_link = await self._ya_player.get_download_link(
+            new_direct_links = await self._ya_player.get_download_links(
                 track_id,
                 codec,
                 bitrate_in_kbps,
             )
-            if new_direct_link is None:
+
+            if new_direct_links is None:
                 return None
 
-            expired = int((time.time() + 8600) * 1e9)
-            cursor.execute(
-                """
-                INSERT INTO direct_link
-                (track_id, link, expired)
-                VALUES(?, ?, ?)
-                ON CONFLICT(track_id)
-                DO UPDATE SET link=excluded.link,expired=excluded.expired
-                """,
-                (track_id, new_direct_link, expired),
-            )
-            log.debug("Direct link: %s, track: %s", new_direct_link, track_id)
-            return new_direct_link
+            for new_direct_link in new_direct_links:
+                log.debug("Check direct link %s", new_direct_link)
+                try:
+                    async with self._client_session.request(
+                        "HEAD",
+                        new_direct_link,
+                    ) as resp:
+                        if not resp.ok:
+                            continue
+                except ClientError as err:
+                    log.error("Fail get direct link: %r", err)  # noqa: TRY400
+                    continue
+
+                expired = int((time.time() + 8600) * 1e9)
+                cursor.execute(
+                    """
+                    INSERT INTO direct_link
+                    (track_id, link, expired)
+                    VALUES(?, ?, ?)
+                    ON CONFLICT(track_id)
+                    DO UPDATE SET link=excluded.link,expired=excluded.expired
+                    """,
+                    (track_id, new_direct_link, expired),
+                )
+                log.debug(
+                    "Direct link: %s, track: %s", new_direct_link, track_id
+                )
+                return new_direct_link
+        return None
 
     def _get_playlist_by_id(self, playlist_id: str) -> SQLPlaylist | None:
         return SQLPlaylist.from_row(
@@ -569,7 +592,7 @@ class YaMusicFS(VirtFS):
             byte = BytesIO()
             async for chunk in resp.content.iter_chunked(1024):
                 byte.write(chunk)
-                new_buffer = track.tag.to_bytes(byte)
+                new_buffer = track.tag.to_bytes(byte, track.codec)
                 if new_buffer is None:
                     continue
                 track.size += track.tag.size
@@ -628,6 +651,7 @@ class YaMusicFS(VirtFS):
                 playlist_id=playlist_id,
                 codec=track.codec,
                 bitrate=track.bitrate_in_kbps,
+                quality=track.quality,
                 size=track.size,
                 artist=tag["artist"],
                 title=tag["title"],
@@ -974,7 +998,7 @@ class YaMusicFS(VirtFS):
 
         buffer = await self._get_buffer(track)
         if buffer is None:
-            raise FUSEError(errno.EPERM)
+            raise FUSEError(errno.EPIPE)
 
         file_info = await super().open(inode, flags, ctx)
         if flags & os.O_RDWR or flags & os.O_WRONLY:
@@ -1015,7 +1039,7 @@ class YaMusicFS(VirtFS):
                     stream_reader.track.playlist_id
                 )
 
-                if playlist is not None and playlist.batch_id is not None:
+                if playlist is not None and playlist.batch_id:
                     await self._ya_player.feedback_track(
                         stream_reader.track.track_id,
                         "trackStarted",
@@ -1050,7 +1074,7 @@ class YaMusicFS(VirtFS):
                     stream_reader.track.playlist_id
                 )
 
-                if playlist is not None and playlist.batch_id is not None:
+                if playlist is not None and playlist.batch_id:
                     await self._ya_player.feedback_track(
                         stream_reader.track.track_id,
                         "trackFinished",
@@ -1098,18 +1122,14 @@ class YaMusicFS(VirtFS):
     def xattrs(self, inode: InodeT) -> dict[str, Any]:
         return {
             "inode": inode,
-            "nlookup": len(self._nlookup),
-            "inode_map_fd": self._inode_map_fd,
-            "queue_invalidate_inode": self.queue_later_invalidate_inode,
+            "inode_map_fd": self._inode_map_fd.get(inode),
             "stream": {
                 fd: {
-                    "name": stream.track.name,
+                    "name": stream.track.name.decode(),
                     "size": stream.track.size,
                     "codec": stream.track.codec,
                     "bitrate": stream.track.bitrate,
-                    "play_second": stream.buffer.total_second()
-                    if stream.buffer is not None
-                    else 0,
+                    "play_second": stream.buffer.total_second(),
                 }
                 for fd, stream in self._fd_map_stream.items()
             },
