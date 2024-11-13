@@ -95,7 +95,7 @@ class SQLRow:
         INSERT INTO {self.__tablename__}
         ({columns})
         VALUES
-        '({placeholders})'
+        ({placeholders})
         """
         return query, data
 
