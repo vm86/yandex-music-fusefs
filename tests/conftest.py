@@ -4,11 +4,22 @@ from pathlib import Path
 import pytest
 
 
-@pytest.fixture
-def m4a_wtihout_tag() -> BytesIO:
-    return BytesIO(initial_bytes=Path("tests/contrib/test.m4a").read_bytes())
+def _load_audio(codec: str) -> BytesIO:
+    return BytesIO(
+        initial_bytes=Path(f"tests/contrib/test.{codec}").read_bytes()
+    )
 
 
 @pytest.fixture
-def mp3_wtihout_tag() -> BytesIO:
-    return BytesIO(initial_bytes=Path("tests/contrib/test.mp3").read_bytes())
+def m4a_audio() -> BytesIO:
+    return _load_audio("m4a")
+
+
+@pytest.fixture
+def mp3_audio() -> BytesIO:
+    return _load_audio("mp3")
+
+
+@pytest.fixture
+def flac_audio() -> BytesIO:
+    return _load_audio("flac")
