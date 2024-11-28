@@ -238,12 +238,10 @@ class VirtFS(Operations):
             return [dict(row) for row in cur.fetchall()]
 
     def _get_fd(self) -> int:
-        for i in range(2048):
-            if i in self._fd_map_inode:
-                continue
-
-            return i
-        raise FUSEError(errno.ENOENT)
+        try:
+            return max(self._fd_map_inode.keys()) + 1
+        except ValueError:
+            return 1
 
     @property
     def _inode_map_fd(self) -> dict[InodeT, set[int]]:
@@ -322,9 +320,10 @@ class VirtFS(Operations):
         return self.__later_invalidate_inode
 
     def _invalidate_inode(self, inode: InodeT) -> None:
+        self.__later_invalidate_inode.discard(inode)
         if inode not in self._nlookup:
             return
-        if len(self._fd_map_inode) > 0:
+        if inode in self._inode_map_fd:
             log.warning(
                 "Invalidate inode %d skip. There are open descriptors.",
                 inode,
@@ -435,6 +434,8 @@ class VirtFS(Operations):
     async def releasedir(self, fd: FileHandleT) -> None:
         inode = self._fd_map_inode.pop(fd)
         self.__fd_token_read.pop(inode, None)
+        if inode in self.__later_invalidate_inode:
+            self._invalidate_inode(inode)
 
     @fail_is_exit
     async def statfs(self, ctx: RequestContext) -> StatvfsData:  # noqa: ARG002
@@ -531,6 +532,8 @@ class VirtFS(Operations):
         if self._get_file_stat_by_inode(inode).st_nlink == 0:
             with self._db_cursor() as cur:
                 cur.execute("DELETE FROM inodes WHERE id=?", (inode,))
+        if inode in self.__later_invalidate_inode:
+            self._invalidate_inode(inode)
 
     @fail_is_exit
     async def unlink(

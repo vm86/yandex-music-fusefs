@@ -261,6 +261,16 @@ class SQLPlaylist(SQLRow):
 
 
 @dataclass
+class SQLDirectLink(SQLRow):
+    __tablename__ = "direct_link"
+
+    track_id: str
+    link: str
+    expired: int
+    id: int | None = None
+
+
+@dataclass
 class StreamReader:
     buffer: Buffer
     track: SQLTrack
@@ -324,8 +334,6 @@ class YaMusicFS(VirtFS):
         self.__client_session: ClientSession | None = None
         self.__ya_player: YandexMusicPlayer | None = None
         self._fd_map_stream: dict[int, StreamReader] = {}
-        self._station_id_map_inode: dict[int, int] = {}
-        self._tracks = 0
 
     async def start(self) -> None:
         self.__client_session = ClientSession(
