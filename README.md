@@ -42,12 +42,6 @@ pip install yandex_fuse-*.tar.gz
 #### Запускаем
 
 ```shell
-systemctl --user start yamusic-fs.service
-```
-
-Или
-
-```shell
 yamusic-fs ~/Music/Yandex/
 ```
 
@@ -63,12 +57,6 @@ yamusic-fs ~/Music/Yandex/
 #### Отмонтировать
 
 ```shell
-systemctl stop yamusic-fs.service --user
-```
-
-Или
-
-```shell
 fusermount -u ~/Music/Yandex
 ```
 
@@ -79,14 +67,14 @@ fusermount -u ~/Music/Yandex
 ```json
 {
   "token": "",
-  "best_codec": "aac",
+  "quality": "hq",
   "blacklist": [],
 }
 ```
 
 token = Токен доступа
 
-best_codec = aac или mp3
+quality = lossless, hq
 
 blacklist = "Черный список" жанров для "Моя волна"
 
