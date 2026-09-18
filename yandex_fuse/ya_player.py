@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -8,15 +9,15 @@ import logging
 import struct
 import time
 import uuid
-import webbrowser
-from asyncio import sleep
+from asyncio import CancelledError, gather, sleep
 from asyncio.tasks import create_task
+from contextlib import suppress
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from mutagen import MutagenError  # type: ignore[attr-defined]
+from mutagen import MutagenError
 from mutagen.flac import FLAC, FLACNoHeaderError
-from mutagen.id3 import (  # type: ignore[attr-defined]
+from mutagen.id3 import (
     TALB,
     TCON,
     TIT2,
@@ -28,6 +29,7 @@ from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
 from yandex_music import (  # type: ignore[import-untyped]
     ClientAsync,
+    DeviceCode,
     Track,
     YandexMusicObject,
 )
@@ -36,7 +38,7 @@ from yandex_music.utils.sign_request import (  # type: ignore[import-untyped]
     DEFAULT_SIGN_KEY,
 )
 
-from yandex_fuse.request import YandexClientRequest
+from yandex_fuse.request import ClientRequest
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -76,6 +78,10 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
                 if key in cls.__dataclass_fields__
             },
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        # yandex_music >=3.0.0 no longer provides to_dict() out of the box.
+        return dataclasses.asdict(self)
 
     def _to_mp4_tag(self, stream: BytesIO) -> bytes | None:
         tag = {}
@@ -130,7 +136,7 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
         new_stream = BytesIO()
         new_stream.write(stream.read())
 
-        audiofile = MP3(fileobj=new_stream)
+        audiofile = MP3(fileobj=new_stream)  # type: ignore[no-untyped-call]
         audiofile.delete(fileobj=new_stream)
         if audiofile.tags is None:
             audiofile.add_tags()  # type: ignore[no-untyped-call]
@@ -154,7 +160,7 @@ class TrackTag(YandexMusicObject):  # type: ignore[misc]
         new_stream.write(stream.read())
         new_stream.seek(0)
         try:
-            audiofile = FLAC(fileobj=new_stream)
+            audiofile = FLAC(fileobj=new_stream)  # type: ignore[no-untyped-call]
         except (FLACNoHeaderError, MutagenError):
             return None
         # https://exiftool.org/TagNames/Vorbis.html
@@ -275,14 +281,30 @@ class DownloadInfo(YandexMusicObject):  # type: ignore[misc]
     url: str
     bitrate: int
     track_id: str
-    size: int
     transport: str
     gain: bool
     real_id: str
+    size: int = 0
+
+    @classmethod
+    def from_json(cls, data: dict[str, Any]) -> DownloadInfo:
+        # api.music.yandex.net/get-file-info returns fields in camelCase
+        # (not snake_case) and without size -- map them by hand.
+        return cls(
+            quality=data["quality"],
+            codec=data["codec"],
+            urls=data["urls"],
+            url=data["url"],
+            bitrate=data["bitrate"],
+            track_id=data["trackId"],
+            transport=data["transport"],
+            gain=data["gain"],
+            real_id=data["realId"],
+        )
 
 
 class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
-    _default_settings: ClassVar = {
+    _default_settings: ClassVar[dict[str, Any]] = {
         "token": None,
         "last_track": None,
         "from_id": f"music-{uuid.uuid4()}",
@@ -290,6 +312,11 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
         "quality": "lossless",
         "blacklist": [],
     }
+
+    # get-file-info is requested one track at a time (a signed HMAC
+    # request, there's no batch endpoint) -- limit the number of
+    # concurrent requests instead of sending them strictly one by one.
+    DOWNLOAD_INFO_CONCURRENCY: ClassVar[int] = 20
 
     def __init__(
         self,
@@ -299,6 +326,8 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
         self.__last_track: str = ""
         self.__last_station_id: tuple[str, str] = ("", "")
         self.__settings: dict[str, Any] = {}
+        self.__auth_url: str | None = None
+        self.__user_code: str | None = None
 
         self.__settings_path = settings_path
         try:
@@ -313,7 +342,7 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
 
         super().__init__(
             self.__settings["token"],
-            request=YandexClientRequest(client_session),
+            request=ClientRequest(client_session),
         )
 
         self.__init_task = None
@@ -323,24 +352,55 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
                 name="init-token",
             )
 
+    def _on_device_code(self, code: DeviceCode) -> None:
+        self.__auth_url = code.verification_url
+        self.__user_code = code.user_code
+        log.info(
+            "Auth: open %s and enter code %s",
+            code.verification_url,
+            code.user_code,
+        )
+
     async def _init_token(self) -> None:
-        qr_link = await self._request.get_qr()
-        webbrowser.open_new_tab(qr_link)
-        response = None
-        while response is None:
-            response = await self._request.login_qr()
-            if response:
-                break
-            await sleep(5)
-        token_info = await self._request.get_music_token(response)
-        self.__settings["token"] = token_info["access_token"]
-        self._request.set_authorization(self.__settings["token"])
-        self.save_settings()
-        log.info("Token saved.")
+        try:
+            token = await self.device_auth(on_code=self._on_device_code)
+            self.__settings["token"] = token.access_token
+            self.__auth_url = None
+            self.__user_code = None
+            self.save_settings()
+            log.info("Token saved.")
+        except CancelledError:
+            raise
+        except Exception:
+            log.exception("Auth failed, retry in 30s.")
+            await sleep(30)
+            self.__init_task = create_task(
+                self._init_token(), name="init-token"
+            )
+            return
         if self.__init_task is not None:
             init_task = self.__init_task
             self.__init_task = None
             init_task.cancel()
+
+    async def aclose(self) -> None:
+        if self.__init_task is None:
+            return
+        init_task = self.__init_task
+        self.__init_task = None
+        init_task.cancel()
+        with suppress(CancelledError):
+            await init_task
+
+    @property
+    def auth_url(self) -> str | None:
+        """Auth page URL, while there's no token yet."""
+        return self.__auth_url
+
+    @property
+    def user_code(self) -> str | None:
+        """Code for manual entry on the auth page."""
+        return self.__user_code
 
     def save_settings(self) -> None:
         self.__settings_path.write_text(json.dumps(self.__settings))
@@ -364,17 +424,29 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
         *,
         exclude_track_ids: set[str],
     ) -> AsyncGenerator[ExtendTrack, None]:
-        for track in tracks:
-            if not track.available:
-                continue
-            if str(track.id) in exclude_track_ids:
-                continue
-            extend_track = ExtendTrack.from_track(track)
-            await self._choose_best_dowanload_info(extend_track)
+        candidates = [
+            ExtendTrack.from_track(track)
+            for track in tracks
+            if track.available and str(track.id) not in exclude_track_ids
+        ]
 
-            yield extend_track
+        # Each track needs its own signed request to get-file-info (see
+        # _get_download_info) -- for 1000 tracks, sequential requests take
+        # tens of minutes, so send them in parallel batches instead.
+        for batch_start in range(
+            0, len(candidates), self.DOWNLOAD_INFO_CONCURRENCY
+        ):
+            batch = candidates[
+                batch_start : batch_start + self.DOWNLOAD_INFO_CONCURRENCY
+            ]
+            loaded = await gather(
+                *(self._choose_best_dowanload_info(track) for track in batch)
+            )
+            for extend_track, ok in zip(batch, loaded, strict=True):
+                if ok:
+                    yield extend_track
 
-    async def next_tracks(
+    async def next_tracks(  # noqa: C901
         self,
         station_id: str,
         *,
@@ -448,7 +520,8 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
 
             if extend_track.track_id in exclude_track_ids:
                 continue
-            await self._choose_best_dowanload_info(extend_track)
+            if not await self._choose_best_dowanload_info(extend_track):
+                continue
             tracks.add(extend_track.save_name)
             yield extend_track
 
@@ -459,7 +532,7 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
     def get_last_station_info(self) -> tuple[str, str]:
         return self.__last_station_id
 
-    async def _get_download_info(self, track_id: str) -> DownloadInfo:
+    async def _get_download_info(self, track_id: str) -> DownloadInfo | None:
         # https://github.com/MarshalX/yandex-music-api/issues/656#issuecomment-2466722441
         timestamp = int(time.time())
         params = {
@@ -481,14 +554,22 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
         resp: dict[str, Any] = await self._request.get(
             "https://api.music.yandex.net/get-file-info", params=params
         )
-        return DownloadInfo(**resp["download_info"])
+        if "downloadInfo" not in resp:
+            log.warning(
+                "Track %s: no downloadInfo in response: %r", track_id, resp
+            )
+            return None
+        return DownloadInfo.from_json(resp["downloadInfo"])
 
-    async def _choose_best_dowanload_info(self, track: ExtendTrack) -> None:
+    async def _choose_best_dowanload_info(self, track: ExtendTrack) -> bool:
         download_info = await self._get_download_info(track.id)
+        if download_info is None:
+            return False
 
         track.codec = download_info.codec
         track.bitrate_in_kbps = download_info.bitrate
         track.quality = download_info.quality
+        return True
 
     async def get_download_links(
         self,
@@ -497,6 +578,8 @@ class YandexMusicPlayer(ClientAsync):  # type: ignore[misc]
         bitrate_in_kbps: int,
     ) -> list[str] | None:
         download_info = await self._get_download_info(track_id)
+        if download_info is None:
+            return None
         log.debug("Track %s, download info: %r", track_id, download_info)
         if bitrate_in_kbps != download_info.bitrate:
             log.warning(

@@ -1,2 +1,2 @@
-recursive-include contrib *.service
+recursive-include yandex_fuse/contrib *.service
 recursive-include yandex_fuse *.py
