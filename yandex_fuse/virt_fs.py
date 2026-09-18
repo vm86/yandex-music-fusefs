@@ -7,9 +7,7 @@ import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, NewType
-
-from typing_extensions import Self
+from typing import TYPE_CHECKING, Any, NewType, Self
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
