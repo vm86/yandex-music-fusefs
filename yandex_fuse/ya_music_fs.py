@@ -14,14 +14,11 @@ from asyncio import (
     wait,
     wait_for,
 )
-from asyncio import (
-    TimeoutError as AsyncTimeoutError,
-)
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import (
     ClientError,
@@ -58,11 +55,7 @@ FEEDBACK_START_SECONDS = 30
 PLAYLIST_ID2NAME = {"likes": "Мне нравится", "user:onyourwave": "Моя волна"}
 
 
-P = ParamSpec("P")
-T = TypeVar("T")
-
-
-def retry_request(
+def retry_request[**P, T](
     func: Callable[P, Coroutine[Any, Any, T]], count: int = 3
 ) -> Callable[P, Coroutine[Any, Any, T | None]]:
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T | None:
@@ -142,7 +135,7 @@ class Buffer:
                 self.__ready_read.clear()
                 try:
                     await wait_for(self.__ready_read.wait(), timeout=5)
-                except AsyncTimeoutError:
+                except TimeoutError:
                     log.warning("Slow downloading %s", self.__track.name)
 
         self.__total_read += size

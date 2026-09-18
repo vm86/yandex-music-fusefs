@@ -1,7 +1,6 @@
 # https://github.com/AlexxIT/YandexStation/blob/master/custom_components/yandex_station/core/yandex_session.py
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from aiohttp import ClientError, ClientSession
@@ -31,7 +30,10 @@ class ClientRequest(Request):  # type: ignore[misc]
         self.__client_session = client_session
 
     async def _request_wrapper(  # noqa: C901
-        self, method: str, url: str, **kwargs: dict[str, Any]
+        self,
+        method: str,
+        url: str,
+        **kwargs: Any,  # noqa: ANN401
     ) -> bytes:
         if "headers" not in kwargs:
             kwargs["headers"] = {}
@@ -52,7 +54,7 @@ class ClientRequest(Request):  # type: ignore[misc]
             ) as _resp:
                 resp = _resp
                 content = await resp.content.read()
-        except asyncio.TimeoutError as e:
+        except TimeoutError as e:
             raise TimedOutError from e
         except ClientError as e:
             raise NetworkError(e) from e

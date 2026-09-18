@@ -18,8 +18,6 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio",
@@ -30,9 +28,8 @@ dependencies = [
     "yandex-music >=3.0.0",
     "mutagen >=1.47.0",
     "aiohttp >=3.9.0",
-    "typing-extensions >=4.6.0",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 [project.urls]
 Homepage = "https://github.com/vm86/yandex-music-fusefs"
@@ -66,7 +63,7 @@ testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "session"
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 80
 indent-width = 4
 
@@ -111,7 +108,7 @@ indent-style = "space"
 docstring-code-format = false
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 warn_unused_ignores = true
 warn_return_any = true
 warn_unreachable = true
