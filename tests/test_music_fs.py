@@ -1,8 +1,6 @@
 # ruff: noqa: S101
-# ruff: noqa: ARG002
 # ruff: noqa: ANN001
 # ruff: noqa: ANN201
-# ruff: noqa: ANN202
 # ruff: noqa: ANN204
 # mypy: ignore-errors
 
@@ -12,7 +10,7 @@ from unittest import mock
 import pytest
 from pytest_mock import MockerFixture
 
-from yandex_fuse.ya_music_fs import SQLTrack, StreamReader, YaMusicFS
+from yandex_fuse.ya_music_fs import SQLPlaylist, SQLTrack, YaMusicFS
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -50,6 +48,14 @@ TRACK_INFO = SQLTrack(
     size=100,
 )
 
+PLAYLIST_INFO = SQLPlaylist(
+    name="TestPlaylist",
+    playlist_id="NOT",
+    inode=1,
+    station_id="station",
+    batch_id="batch",
+)
+
 
 @pytest.fixture(autouse="True")
 def client_session_mock():
@@ -67,60 +73,186 @@ class TestMusicFS:
         yandex_music.FILE_DB = "file::memory:?cache=shared"
         return yandex_music()
 
-    @mock.patch("yandex_fuse.ya_music_fs.YaMusicFS._get_track_by_inode")
-    @mock.patch("yandex_fuse.ya_music_fs.YaMusicFS.get_or_update_direct_link")
-    async def test_open(
+    async def test_read_track_missing_returns_none(
         self,
-        mock_get_or_update_direct_link: mock.Mock,
-        mock_get_track_by_inode: mock.Mock,
         ya_music_fs: YaMusicFS,
+        mocker: MockerFixture,
     ) -> None:
-        mock_get_track_by_inode.return_value = TRACK_INFO
-        file_info = await ya_music_fs.open(519, 0o664, None)
-        assert file_info.fh == 1
+        mocker.patch.object(
+            ya_music_fs, "_get_track_by_inode", return_value=None
+        )
 
-        assert mock_get_or_update_direct_link.call_count == 1
+        chunk = await ya_music_fs.read_track(999, 0, 100)
+        assert chunk is None
 
-        file_info = await ya_music_fs.open(519, 0o664, None)
-        assert file_info.fh == 2  # noqa: PLR2004
-
-    async def test_read(
+    async def test_read_track_reuses_cached_buffer(
         self,
         ya_music_fs: YaMusicFS,
         mocker: MockerFixture,
     ) -> None:
         buffer = mock.MagicMock()
+        buffer.read_from = mock.AsyncMock(return_value=b"Test")
+        buffer.is_downloded = False
+        buffer.is_send_feedback = True
 
-        buffer.read_from = mock.AsyncMock()
-        buffer.read_from.return_value = b"Test"
-        buffer.total_second.return_value = 0
-
-        stream = StreamReader(
-            buffer=buffer,
-            track=TRACK_INFO,
-            is_send_feedback=False,
+        mocker.patch.object(
+            ya_music_fs, "_get_track_by_inode", return_value=TRACK_INFO
         )
-        mocker.patch.object(ya_music_fs, "_fd_map_stream", {10: stream})
-        chunk = await ya_music_fs.read(10, 100, 100)
+        get_buffer = mocker.patch.object(
+            ya_music_fs, "_get_buffer", mock.AsyncMock(return_value=buffer)
+        )
+        mocker.patch.object(ya_music_fs, "_track_buffers", {})
+
+        chunk = await ya_music_fs.read_track(TRACK_INFO.inode, 0, 100)
+        assert chunk == b"Test"
+        chunk = await ya_music_fs.read_track(TRACK_INFO.inode, 0, 100)
         assert chunk == b"Test"
 
-    @mock.patch("yandex_fuse.virt_fs.VirtFS._get_file_stat_by_inode")
-    async def test_release(
+        assert get_buffer.call_count == 1
+
+    async def test_read_track_sends_started_feedback(
         self,
-        mock_get_file_stat_by_inode: mock.Mock(),
         ya_music_fs: YaMusicFS,
         mocker: MockerFixture,
     ) -> None:
-        stream = StreamReader(
-            buffer=mock.MagicMock(),
-            track=TRACK_INFO,
-            is_send_feedback=False,
+        buffer = mock.MagicMock()
+        buffer.read_from = mock.AsyncMock(return_value=b"Test")
+        buffer.is_downloded = True
+        buffer.is_send_feedback = False
+        buffer.total_second.return_value = 31
+
+        mocker.patch.object(
+            ya_music_fs, "_get_track_by_inode", return_value=TRACK_INFO
         )
-        mocker.patch.object(ya_music_fs, "_fd_map_inode", {10: 519})
-        mocker.patch.object(ya_music_fs, "_fd_map_stream", {10: stream})
+        mocker.patch.object(
+            ya_music_fs,
+            "_get_playlist_by_id",
+            return_value=PLAYLIST_INFO,
+        )
+        mocker.patch.object(
+            ya_music_fs, "_track_buffers", {TRACK_INFO.inode: buffer}
+        )
+        feedback_track = mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "feedback_track",
+            mock.AsyncMock(),
+        )
 
-        await ya_music_fs.release(10)
+        await ya_music_fs.read_track(TRACK_INFO.inode, 0, 4)
 
-        # TODO(vm86): check via mock
-        assert ya_music_fs._fd_map_inode == {}  # noqa: SLF001
-        assert ya_music_fs._fd_map_stream == {}  # noqa: SLF001
+        feedback_track.assert_awaited_once_with(
+            TRACK_INFO.track_id,
+            "trackStarted",
+            PLAYLIST_INFO.station_id,
+            PLAYLIST_INFO.batch_id,
+            0,
+        )
+        assert buffer.is_send_feedback is True
+
+    async def test_read_track_sends_finished_feedback_at_eof(
+        self,
+        ya_music_fs: YaMusicFS,
+        mocker: MockerFixture,
+    ) -> None:
+        buffer = mock.MagicMock()
+        buffer.read_from = mock.AsyncMock(return_value=b"Test")
+        buffer.is_downloded = False
+        buffer.is_send_feedback = False
+        buffer.total_second.return_value = 5
+
+        mocker.patch.object(
+            ya_music_fs, "_get_track_by_inode", return_value=TRACK_INFO
+        )
+        mocker.patch.object(
+            ya_music_fs,
+            "_get_playlist_by_id",
+            return_value=PLAYLIST_INFO,
+        )
+        mocker.patch.object(
+            ya_music_fs, "_track_buffers", {TRACK_INFO.inode: buffer}
+        )
+        feedback_track = mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "feedback_track",
+            mock.AsyncMock(),
+        )
+
+        offset = TRACK_INFO.size - 4
+        await ya_music_fs.read_track(TRACK_INFO.inode, offset, 4)
+
+        feedback_track.assert_awaited_once_with(
+            TRACK_INFO.track_id,
+            "trackFinished",
+            PLAYLIST_INFO.station_id,
+            PLAYLIST_INFO.batch_id,
+            5,
+        )
+        assert buffer.is_send_feedback is True
+
+    async def test_needs_auth_without_token(
+        self,
+        ya_music_fs: YaMusicFS,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "is_init",
+            False,
+        )
+
+        assert ya_music_fs.needs_auth is True
+
+    async def test_needs_auth_with_token(
+        self,
+        ya_music_fs: YaMusicFS,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "is_init",
+            True,
+        )
+
+        assert ya_music_fs.needs_auth is False
+
+    async def test_auth_page_contains_url_and_code(
+        self,
+        ya_music_fs: YaMusicFS,
+        mocker: MockerFixture,
+    ) -> None:
+        auth_url = "https://passport.yandex.ru/activate"
+        mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "auth_url",
+            auth_url,
+        )
+        mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "user_code",
+            "ABCD-1234",
+        )
+
+        html = ya_music_fs.auth_page()
+
+        assert auth_url.encode() in html
+        assert b"ABCD-1234" in html
+
+    async def test_auth_page_without_code_yet(
+        self,
+        ya_music_fs: YaMusicFS,
+        mocker: MockerFixture,
+    ) -> None:
+        mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "auth_url",
+            None,
+        )
+        mocker.patch.object(
+            ya_music_fs._ya_player,  # noqa: SLF001
+            "user_code",
+            None,
+        )
+
+        html = ya_music_fs.auth_page()
+
+        assert b"<html>" in html

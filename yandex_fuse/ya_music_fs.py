@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import errno
 import logging
-import os
 import stat
 import time
 from asyncio import (
@@ -32,15 +30,6 @@ from aiohttp import (
     ConnectionTimeoutError,
     SocketTimeoutError,
 )
-from pyfuse3 import (
-    FileHandleT,
-    FileInfo,
-    FlagT,
-    FUSEError,
-    InodeT,
-    RequestContext,
-    XAttrNameT,
-)
 from yandex_music.exceptions import (  # type: ignore[import-untyped]
     BadRequestError,
     NetworkError,
@@ -49,7 +38,7 @@ from yandex_music.exceptions import (  # type: ignore[import-untyped]
     UnauthorizedError,
 )
 
-from yandex_fuse.virt_fs import SQLRow, VirtFS, fail_is_exit
+from yandex_fuse.virt_fs import InodeT, SQLRow, VirtFS
 from yandex_fuse.ya_player import ExtendTrack, TrackTag, YandexMusicPlayer
 
 if TYPE_CHECKING:
@@ -64,6 +53,7 @@ log = logging.getLogger(__name__)
 
 LIMIT_TASKS = 10
 LIMIT_ONYOURWAVE = 150
+FEEDBACK_START_SECONDS = 30
 
 PLAYLIST_ID2NAME = {"likes": "Мне нравится", "user:onyourwave": "Моя волна"}
 
@@ -73,8 +63,8 @@ T = TypeVar("T")
 
 
 def retry_request(
-    func: Callable[..., Coroutine[Any, Any, T]], count: int = 3
-) -> Callable[..., Coroutine[Any, Any, T | None]]:
+    func: Callable[P, Coroutine[Any, Any, T]], count: int = 3
+) -> Callable[P, Coroutine[Any, Any, T | None]]:
     async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T | None:
         for retry in range(1, count + 1):
             try:
@@ -104,7 +94,7 @@ class Buffer:
         direct_link: str,
         client_session: ClientSession,
         track: SQLTrack,
-        fuse_music: YaMusicFS,
+        music_fs: YaMusicFS,
     ) -> None:
         self.__direct_link = direct_link
         self.__client_session = client_session
@@ -113,12 +103,13 @@ class Buffer:
         self.__track = track
         self.__total_read = 0
         self.__tag = TrackTag.from_json(track.__dict__)
-        self.__fuse_music = fuse_music
+        self.__music_fs = music_fs
         self.__download_task: Task[Any] | None = create_task(
             self.download(), name="download"
         )
         self.__tagging = False
         self.__ready_read = Event()
+        self.is_send_feedback = False
 
     def __del__(self) -> None:
         self.__ready_read.set()
@@ -203,7 +194,7 @@ class Buffer:
         except CancelledError:
             raise
         except ConnectionTimeoutError:
-            direct_link = await self.__fuse_music.get_or_update_direct_link(
+            direct_link = await self.__music_fs.get_or_update_direct_link(
                 self.__track.track_id,
                 self.__track.codec,
                 self.__track.bitrate,
@@ -270,13 +261,6 @@ class SQLDirectLink(SQLRow):
     id: int | None = None
 
 
-@dataclass
-class StreamReader:
-    buffer: Buffer
-    track: SQLTrack
-    is_send_feedback: bool = False
-
-
 class YaMusicFS(VirtFS):
     FILE_DB = str(Path.home().joinpath(".cache/yandex-fuse2.db"))
 
@@ -329,11 +313,12 @@ class YaMusicFS(VirtFS):
 
     CHUNK_SIZE = 128
 
-    def __init__(self, *args: P.args, **kwargs: P.kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self) -> None:
+        super().__init__()
         self.__client_session: ClientSession | None = None
         self.__ya_player: YandexMusicPlayer | None = None
-        self._fd_map_stream: dict[int, StreamReader] = {}
+        self.__task: Task[Any] | None = None
+        self._track_buffers: dict[InodeT, Buffer] = {}
 
     async def start(self) -> None:
         self.__client_session = ClientSession(
@@ -345,6 +330,19 @@ class YaMusicFS(VirtFS):
             self.__client_session,
         )
         self.__task = create_task(self.__fsm(), name="fsm")
+
+    async def aclose(self) -> None:
+        if self.__task is not None:
+            self.__task.cancel()
+            with suppress(CancelledError):
+                await self.__task
+            self.__task = None
+
+        if self.__ya_player is not None:
+            await self.__ya_player.aclose()
+
+        if self.__client_session is not None:
+            await self.__client_session.close()
 
     @property
     def _client_session(self) -> ClientSession:
@@ -359,6 +357,41 @@ class YaMusicFS(VirtFS):
                 "YandexMusicPlayer is not init! %r", self.__ya_player
             )
         return self.__ya_player
+
+    @property
+    def needs_auth(self) -> bool:
+        """While there's no Yandex Music token, the root shows an auth page."""
+        return not self._ya_player.is_init
+
+    def auth_page(self) -> bytes:
+        """HTML for the virtual AUTH_PAGE_NAME: login link plus the code.
+
+        Device Flow doesn't imply an instant redirect: the user first notes
+        the code, then opens the link themselves and enters the code there.
+        This only auto-refreshes while the code hasn't been issued yet,
+        with no further auto-redirect.
+        """
+        auth_url = self._ya_player.auth_url
+        user_code = self._ya_player.user_code
+        if auth_url is None or user_code is None:
+            meta_refresh = '<meta http-equiv="refresh" content="2">'
+            body = "<p>Получение кода авторизации...</p>"
+        else:
+            meta_refresh = ""
+            body = (
+                f'<p>Откройте <a href="{auth_url}">{auth_url}</a> '
+                "и введите код:</p>"
+                '<p style="font-size:2.5em;font-weight:bold;'
+                f'letter-spacing:0.1em">{user_code}</p>'
+            )
+        return (
+            "<!doctype html>"
+            "<html><head>"
+            '<meta charset="utf-8">'
+            f"{meta_refresh}"
+            "<title>Авторизация Яндекс.Музыки</title>"
+            f"</head><body>{body}</body></html>"
+        ).encode()
 
     @contextmanager
     def _get_direct_link(
@@ -691,7 +724,6 @@ class YaMusicFS(VirtFS):
                     "DELETE FROM tracks WHERE inode=? AND track_id=?",
                     (track.inode, track.track_id),
                 )
-        self._invalidate_inode(track.inode)
 
     def _get_tracks(
         self, playlist_id: str | None = None
@@ -764,7 +796,6 @@ class YaMusicFS(VirtFS):
             track.track_id for track in users_likes_tracks.tracks
         }
         loaded_tracks = self._get_tracks(playlist_id)
-        tracks = await users_likes_tracks.fetch_tracks()
 
         new_tracks_ids = like_tracks_ids - loaded_tracks.keys()
         unlink_tracks_ids = loaded_tracks.keys() - like_tracks_ids
@@ -811,7 +842,6 @@ class YaMusicFS(VirtFS):
         else:
             log.warning("Playlist is partially updated!")
 
-        self._invalidate_inode(dir_inode)
         log.info(
             "Loaded track in like playlist %d.",
             users_likes_tracks.revision,
@@ -870,7 +900,6 @@ class YaMusicFS(VirtFS):
             _, batch_id = self._ya_player.get_last_station_info()
             self._update_plyalist(playlist_id, 0, batch_id)
         log.info("Playlist onyourwave is updated.")
-        self._invalidate_inode(dir_inode)
 
     async def __cleanup_track(self) -> None:
         loaded_tracks = self._get_tracks()
@@ -880,7 +909,7 @@ class YaMusicFS(VirtFS):
 
         loaded_tracks_by_id = {}
         for track_id, track in loaded_tracks.items():
-            track_id_without_album_id, *unused = track_id.split(":", 1)
+            track_id_without_album_id, *_unused = track_id.split(":", 1)
             loaded_tracks_by_id[track_id_without_album_id] = track
 
         ya_tracks = await self._ya_player.tracks(track_ids=loaded_tracks.keys())
@@ -1001,156 +1030,64 @@ class YaMusicFS(VirtFS):
             return None
         return Buffer(direct_link, self._client_session, track, self)
 
-    @fail_is_exit
-    async def open(
-        self,
-        inode: InodeT,
-        flags: FlagT,
-        ctx: RequestContext,
-    ) -> FileInfo:
+    async def read_track(
+        self, inode: InodeT, offset: int, size: int
+    ) -> bytes | None:
+        # NFS READ is stateless (no open/release), so the download buffer
+        # is cached per inode across calls; eviction of idle buffers is
+        # not implemented yet.
         track = self._get_track_by_inode(inode)
-
         if track is None:
-            raise FUSEError(errno.ENOENT)
+            return None
 
-        if not self._ya_player.is_init:
-            raise FUSEError(errno.EPERM)
-
-        buffer = await self._get_buffer(track)
+        buffer = self._track_buffers.get(inode)
         if buffer is None:
-            raise FUSEError(errno.EPIPE)
+            buffer = await self._get_buffer(track)
+            if buffer is None:
+                return None
+            self._track_buffers[inode] = buffer
 
-        file_info = await super().open(inode, flags, ctx)
-        if flags & os.O_RDWR or flags & os.O_WRONLY:
-            raise FUSEError(errno.EPERM)
-
-        log.debug("Open stream %s -> %d", track.name, file_info.fh)
-        self._fd_map_stream[file_info.fh] = StreamReader(
-            track=track,
-            buffer=buffer,
-        )
-
-        return file_info
-
-    @fail_is_exit
-    async def read(self, fd: FileHandleT, offset: int, size: int) -> bytes:
-        stream_reader = self._fd_map_stream[fd]
-
-        try:
-            chunk = await stream_reader.buffer.read_from(offset, size)
-        except RuntimeError:
-            raise FUSEError(errno.EPIPE) from None
-
-        if len(chunk) > size:
-            log.warning(
-                "Chunk is corrupt. Invalid size chunk %d > %d",
-                len(chunk),
-                size,
-            )
-            raise FUSEError(errno.EPIPE)
-
-        try:
-            if (
-                not stream_reader.is_send_feedback
-                and stream_reader.buffer.is_downloded
-                and stream_reader.buffer.total_second() > 30  # noqa: PLR2004
-            ):
-                playlist = self._get_playlist_by_id(
-                    stream_reader.track.playlist_id
-                )
-
-                if playlist is not None and playlist.batch_id:
-                    await self._ya_player.feedback_track(
-                        stream_reader.track.track_id,
-                        "trackStarted",
-                        playlist.station_id,
-                        playlist.batch_id,
-                        0,
-                    )
-                    stream_reader.is_send_feedback = True
-        except CancelledError:
-            raise
-        except Exception:
-            log.exception("Error send feedback:")
-
+        chunk = await buffer.read_from(offset, size)
+        await self._send_playback_feedback(track, buffer, offset, len(chunk))
         return chunk
 
-    @fail_is_exit
-    async def release(self, fd: FileHandleT) -> None:
-        await super().release(fd)
-
-        stream_reader = self._fd_map_stream.pop(fd, None)
-        if stream_reader is None:
-            log.warning("FD %d is none.", fd)
-            return
-        log.debug("Release stream %d > %s", fd, stream_reader.track.name)
-
+    async def _send_playback_feedback(
+        self, track: SQLTrack, buffer: Buffer, offset: int, chunk_size: int
+    ) -> None:
+        # There's no explicit close() like FUSE's release() had: playback
+        # is considered finished once the end of the file is reached.
         try:
             if (
-                not stream_reader.is_send_feedback
-                and stream_reader.buffer.is_downloded
+                not buffer.is_send_feedback
+                and buffer.is_downloded
+                and buffer.total_second() > FEEDBACK_START_SECONDS
             ):
-                playlist = self._get_playlist_by_id(
-                    stream_reader.track.playlist_id
+                await self._feedback_track(track, "trackStarted", 0)
+                buffer.is_send_feedback = True
+            elif (
+                not buffer.is_send_feedback
+                and offset + chunk_size >= track.size
+            ):
+                await self._feedback_track(
+                    track, "trackFinished", buffer.total_second()
                 )
-
-                if playlist is not None and playlist.batch_id:
-                    await self._ya_player.feedback_track(
-                        stream_reader.track.track_id,
-                        "trackFinished",
-                        playlist.station_id,
-                        playlist.batch_id,
-                        stream_reader.buffer.total_second(),
-                    )
-                    stream_reader.is_send_feedback = True
+                buffer.is_send_feedback = True
         except CancelledError:
             raise
         except Exception:
             log.exception("Error send feedback:")
 
-    @fail_is_exit
-    async def setxattr(
-        self,
-        inode: InodeT,
-        name: XAttrNameT,
-        value: bytes,
-        ctx: RequestContext,  # noqa: ARG002
+    async def _feedback_track(
+        self, track: SQLTrack, event: str, played_seconds: int
     ) -> None:
-        track = self._get_track_by_inode(inode)
-        if track is None:
-            raise FUSEError(errno.ENOENT)
-
-        playlist_info = self._get_playlist_by_id(track.playlist_id)
-        if playlist_info is None:
-            raise FUSEError(errno.ENOENT)
-
-        if name == b".invalidate":
-            self._invalidate_inode(inode)
-
-        if name == b"update":
-            if value == b".recreate":
-                self._unlink_track(track.track_id, playlist_info.inode)
-
-            ya_tracks = await self._ya_player.tracks(track_ids=[track.track_id])
-            async for ya_track in self._ya_player.load_tracks(
-                ya_tracks, exclude_track_ids=set()
-            ):
-                await self._update_track(
-                    ya_track, track.playlist_id, playlist_info.inode
-                )
-
-    def xattrs(self, inode: InodeT) -> dict[str, Any]:
-        return {
-            "inode": inode,
-            "inode_map_fd": self._inode_map_fd.get(inode),
-            "stream": {
-                fd: {
-                    "name": stream.track.name.decode(),
-                    "size": stream.track.size,
-                    "codec": stream.track.codec,
-                    "bitrate": stream.track.bitrate,
-                    "play_second": stream.buffer.total_second(),
-                }
-                for fd, stream in self._fd_map_stream.items()
-            },
-        }
+        playlist = self._get_playlist_by_id(track.playlist_id)
+        if playlist is None or not playlist.batch_id:
+            return
+        await self._ya_player.feedback_track(
+            track.track_id,
+            event,
+            playlist.station_id,
+            playlist.batch_id,
+            played_seconds,
+        )
+        log.debug("%s: %s", event, track.name)

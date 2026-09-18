@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools >= 65.0", "setuptools-scm >= 8"]
+requires = ["setuptools >= 77.0", "setuptools-scm >= 8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,36 @@ dynamic = ["version"]
 description = "Yandex Music Fuse FS"
 readme = "README.md"
 authors = [{ name = "Roman Nebaluev" }]
-license = { text = "LGPLv3" }
-keywords = ["yandex", "music", "fuse", "filesystem"]
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE", "COPYING.LESSER"]
+keywords = ["yandex", "music", "fuse", "filesystem", "nfs"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: System :: Filesystems",
+]
 
-dependencies = ["yandex-music >=2.2.0", "mutagen >=1.47.0", "pyfuse3 >=3.4.0"]
+dependencies = [
+    "yandex-music >=3.0.0",
+    "mutagen >=1.47.0",
+    "aiohttp >=3.9.0",
+    "typing-extensions >=4.6.0",
+]
 requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://github.com/vm86/yandex-music-fusefs"
+Repository = "https://github.com/vm86/yandex-music-fusefs"
+Issues = "https://github.com/vm86/yandex-music-fusefs/issues"
 
 [project.optional-dependencies]
 test = ["pytest", "pytest-asyncio", "pytest-mock", "coverage", "pytest-cov"]
@@ -26,7 +51,7 @@ zip-safe = false
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["yandex_fuse"]
+include = ["yandex_fuse", "yandex_fuse.*"]
 
 [tool.setuptools.package-data]
 "yandex_fuse" = ["contrib/*"]
@@ -50,6 +75,7 @@ indent-width = 4
 select = ["ALL"]
 # D10* Missing docstring
 ignore = [
+    "CPY001",
     "D10",
     "D204",
     "D203",
